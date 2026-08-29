@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
+import json
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +39,8 @@ _MAP_ROLES = {
     "Tb.N": "trabecular_number_map",
     "Ct.Th": "cortical_thickness_map",
     "Ct.Po.Dm": "cortical_porosity_map",
+    "Tb.BMD": "material_map",
+    "Ct.BMD": "material_map",
 }
 
 
@@ -69,16 +73,26 @@ def run_microarchitecture_batch(
     if not cases:
         raise ValueError("No complete microarchitecture input case was found")
 
+    existing_records = _read_existing_records(root)
     output_records: list[DerivativeRecord] = []
     measurement_records: list[DerivativeRecord] = []
     for case in cases:
         subject_id, site, session_id, stack_index, space = _case_key(case["bone_segmentation"])
-        _emit(progress, subject_id, site, session_id, "measure", "started", "Computing microarchitecture")
-        masks = {role: _load_volume(record.path).array for role, record in case.items() if role != "transformed_image"}
         image = _load_volume(case["transformed_image"].path)
         case_spacing = image.spacing if image.spacing is not None else spacing
         if case_spacing is None:
             raise ValueError("spacing must be supplied for .npy batch inputs without image geometry")
+        input_ids = tuple(record.record_id for record in case.values())
+        settings_hash = _compatibility_hash(input_ids, case_spacing, use_common_region, thickness_method, thickness_backend)
+        case_key = _output_case_key(case["bone_segmentation"])
+        reused = _find_compatible_measurement_record(existing_records, case_key, input_ids, settings_hash, case)
+        if reused is not None:
+            measurement_records.append(reused)
+            _emit(progress, subject_id, site, session_id, "measure", "reused", "Reused compatible measurements", reused.path)
+            continue
+
+        _emit(progress, subject_id, site, session_id, "measure", "started", "Computing microarchitecture")
+        masks = {role: _load_volume(record.path).array for role, record in case.items() if role != "transformed_image"}
         common = masks.pop("scan_region_native_common", None) if use_common_region else None
         if common is not None:
             common = np.asarray(common) > 0
@@ -105,6 +119,7 @@ def run_microarchitecture_batch(
             "use_common_region": common is not None,
             "thickness_method": thickness_method,
             "thickness_backend": result.metadata["thickness_backend"],
+            "settings_hash": settings_hash,
         }
         measurement_record = DerivativeRecord(
                 derivative="Microarchitecture",
@@ -116,16 +131,15 @@ def run_microarchitecture_batch(
                 space="table",
                 path=output_path,
                 source="generated",
-                inputs=tuple(record.record_id for record in case.values()),
+                inputs=input_ids,
                 metadata=record_metadata,
                 content_type="table",
+                settings_hash=settings_hash,
         )
         output_records.append(measurement_record)
         measurement_records.append(measurement_record)
         for map_name, map_array in result.maps.items():
-            role = _MAP_ROLES.get(map_name)
-            if role is None:
-                continue
+            role = _MAP_ROLES.get(map_name, "material_map")
             extension = ".nii.gz" if image.sitk_image is not None else ".npy"
             map_filename = f"sub-{subject_id}_{session_part}_site-{site}_map-{map_name.lower().replace('.', '-')}{extension}"
             map_path = record_output_path(
@@ -143,22 +157,26 @@ def run_microarchitecture_batch(
                     space="native",
                     path=map_path,
                     source="generated",
-                    inputs=tuple(record.record_id for record in case.values()),
-                    metadata=record_metadata,
+                    inputs=input_ids,
+                    metadata={**record_metadata, "map_name": map_name},
                     content_type="image",
+                    settings_hash=settings_hash,
                 )
             )
         _emit(progress, subject_id, site, session_id, "measure", "completed", "Wrote measurements", output_path)
 
-    existing_records = _read_existing_records(root)
-    replaced_cases = {_output_case_key(record) for record in output_records}
-    merged_records = [record for record in existing_records if _output_case_key(record) not in replaced_cases]
-    merged_records.extend(output_records)
-    manifest = DerivativeManifest.create(
-        "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.1.0"},
-        records=tuple(merged_records),
-    )
-    write_manifest(manifest, manifest_path(root, "Microarchitecture"))
+    if output_records:
+        superseded = {(_output_case_key(record), _record_signature(record)) for record in output_records}
+        merged_records = [
+            record for record in existing_records
+            if (_output_case_key(record), _record_signature(record)) not in superseded
+        ]
+        merged_records.extend(output_records)
+        manifest = DerivativeManifest.create(
+            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.1.0"},
+            records=tuple(merged_records),
+        )
+        write_manifest(manifest, manifest_path(root, "Microarchitecture"))
     return measurement_records
 
 
@@ -254,6 +272,45 @@ def _read_existing_records(root: Path) -> tuple[DerivativeRecord, ...]:
 
 def _output_case_key(record: DerivativeRecord) -> tuple[str, str, str | None, int | None]:
     return record.subject_id, record.site, record.session_id, record.stack_index
+
+
+def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method, thickness_backend) -> str:
+    payload = {
+        "inputs": list(input_ids),
+        "spacing": [float(value) for value in spacing],
+        "use_common_region": bool(use_common_region),
+        "thickness_method": str(thickness_method),
+        "thickness_backend": str(thickness_backend),
+    }
+    return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _expected_output_signatures(case: dict[str, DerivativeRecord]) -> set[tuple[str, str, str | None]]:
+    names = {"Tb.Th", "Tb.Sp", "Tb.N", "Tb.BMD"}
+    if "cortical_mask" in case:
+        names.update({"Ct.Th", "Ct.Po.Dm", "Ct.BMD"})
+    return {("measurements_table", "table", None)} | {
+        (_MAP_ROLES.get(name, "material_map"), "native", name) for name in names
+    }
+
+
+def _record_signature(record: DerivativeRecord) -> tuple[str, str, str | None]:
+    return record.role, record.space, record.metadata.get("map_name")
+
+
+def _find_compatible_measurement_record(existing, case_key, input_ids, settings_hash, case):
+    required = _expected_output_signatures(case)
+    matching = [
+        record for record in existing
+        if _output_case_key(record) == case_key
+        and record.inputs == input_ids
+        and record.settings_hash == settings_hash
+        and record.path.is_file()
+    ]
+    by_signature = {_record_signature(record): record for record in matching}
+    if not required <= set(by_signature):
+        return None
+    return by_signature[("measurements_table", "table", None)]
 
 
 def _emit(progress, subject_id, site, session_id, step, status, message, path=None) -> None:

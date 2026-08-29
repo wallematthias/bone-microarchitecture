@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run-batch":
         run_microarchitecture_batch(
             args.dataset_root,
-            spacing=tuple(args.spacing),
+            spacing=tuple(args.spacing) if args.spacing is not None else None,
             use_common_region=not args.no_common_region,
             thickness_method=args.thickness_method,
             thickness_backend=args.thickness_backend,
