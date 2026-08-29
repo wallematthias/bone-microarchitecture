@@ -278,6 +278,12 @@ def test_batch_reuses_compatible_records_and_recomputes_when_settings_or_inputs_
         return original(**kwargs)
 
     monkeypatch.setattr(batch, "compute_microarchitecture", counted_compute)
+    batch.run_microarchitecture_batch(
+        tmp_path, spacing=(1.0, 1.0, 1.0), thickness_method="edt", thickness_backend="cpu", force=True
+    )
+    assert calls == ["edt"]
+
+    calls.clear()
     batch.run_microarchitecture_batch(tmp_path, spacing=(1.0, 1.0, 1.0), thickness_method="hildebrand", thickness_backend="cpu")
     assert calls == ["hildebrand"]
 

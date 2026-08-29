@@ -56,6 +56,7 @@ def run_microarchitecture_batch(
     *,
     spacing: tuple[float, float, float] | None = None,
     use_common_region: bool = True,
+    force: bool = False,
     thickness_method: str = "hildebrand",
     thickness_backend: str = "auto",
     progress: Callable[[DerivativeProgressEvent], None] | None = None,
@@ -85,7 +86,9 @@ def run_microarchitecture_batch(
         input_ids = tuple(record.record_id for record in case.values())
         settings_hash = _compatibility_hash(input_ids, case_spacing, use_common_region, thickness_method, thickness_backend)
         case_key = _output_case_key(case["bone_segmentation"])
-        reused = _find_compatible_measurement_record(existing_records, case_key, input_ids, settings_hash, case)
+        reused = None if force else _find_compatible_measurement_record(
+            existing_records, case_key, input_ids, settings_hash, case
+        )
         if reused is not None:
             measurement_records.append(reused)
             _emit(progress, subject_id, site, session_id, "measure", "reused", "Reused compatible measurements", reused.path)
