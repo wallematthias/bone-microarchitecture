@@ -100,6 +100,55 @@ def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurem
     assert all(record.path.is_file() and "/maps/" in str(record.path) for record in map_records)
 
 
+def test_batch_excludes_unused_common_region_from_provenance(tmp_path):
+    """Disabling common-region clipping must also omit it from output inputs."""
+    from bone_microarchitecture.batch import run_microarchitecture_batch
+
+    image = np.ones((4, 4, 4), dtype=np.float32)
+    paths = {
+        "image": "inputs/sub-SAMPLE001_ses-1_image.npy",
+        "bone": "inputs/sub-SAMPLE001_ses-1_bone.npy",
+        "peri": "inputs/sub-SAMPLE001_ses-1_peri.npy",
+        "trab": "inputs/sub-SAMPLE001_ses-1_trab.npy",
+        "common": "inputs/sub-SAMPLE001_ses-1_common.npy",
+    }
+    for path in paths.values():
+        output = tmp_path / path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        np.save(output, image)
+    common_record = _record(tmp_path, "scan_region_native_common", paths["common"], derivative="CommonRegion")
+    write_manifest(
+        DerivativeManifest.create(
+            "Segmentation",
+            tmp_path,
+            {"name": "test", "version": "1"},
+            records=(
+                _record(tmp_path, "transformed_image", paths["image"], derivative="Registration"),
+                _record(tmp_path, "bone_segmentation", paths["bone"]),
+                _record(tmp_path, "periosteal_mask", paths["peri"]),
+                _record(tmp_path, "trabecular_mask", paths["trab"]),
+            ),
+        ),
+        tmp_path / "derivatives/Segmentation/manifest.json",
+    )
+    write_manifest(
+        DerivativeManifest.create("CommonRegion", tmp_path, {"name": "test", "version": "1"}, records=(common_record,)),
+        tmp_path / "derivatives/CommonRegion/manifest.json",
+    )
+
+    records = run_microarchitecture_batch(
+        tmp_path,
+        spacing=(1.0, 1.0, 1.0),
+        use_common_region=False,
+        thickness_method="edt",
+        thickness_backend="cpu",
+    )
+
+    assert common_record.record_id not in records[0].inputs
+    output_records = read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
+    assert all(common_record.record_id not in record.inputs for record in output_records)
+
+
 def test_batch_uses_nifti_geometry_and_common_region_for_measurement(tmp_path):
     """NIfTI geometry, not a unit-spacing default, determines physical volume."""
     sitk = pytest.importorskip("SimpleITK")

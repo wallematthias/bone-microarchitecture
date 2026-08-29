@@ -83,7 +83,12 @@ def run_microarchitecture_batch(
         case_spacing = image.spacing if image.spacing is not None else spacing
         if case_spacing is None:
             raise ValueError("spacing must be supplied for .npy batch inputs without image geometry")
-        input_ids = tuple(record.record_id for record in case.values())
+        input_roles = ["transformed_image", "bone_segmentation", "periosteal_mask", "trabecular_mask"]
+        if "cortical_mask" in case:
+            input_roles.append("cortical_mask")
+        if use_common_region and "scan_region_native_common" in case:
+            input_roles.append("scan_region_native_common")
+        input_ids = tuple(case[role].record_id for role in input_roles)
         settings_hash = _compatibility_hash(input_ids, case_spacing, use_common_region, thickness_method, thickness_backend)
         case_key = _output_case_key(case["bone_segmentation"])
         reused = None if force else _find_compatible_measurement_record(
