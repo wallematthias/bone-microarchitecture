@@ -181,7 +181,7 @@ def run_microarchitecture_batch(
         ]
         merged_records.extend(output_records)
         manifest = DerivativeManifest.create(
-            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.1.0"},
+            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.2.0"},
             records=tuple(merged_records),
         )
         write_manifest(manifest, manifest_path(root, "Microarchitecture"))

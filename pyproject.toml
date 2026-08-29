@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bone-microarchitecture"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lightweight bone microarchitecture measurements from masks and calibrated grayscale arrays."
 readme = "README.md"
 requires-python = ">=3.10"
