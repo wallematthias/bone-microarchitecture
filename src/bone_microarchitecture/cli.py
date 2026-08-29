@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     batch = commands.add_parser("run-batch", help="write Microarchitecture derivatives for a dataset")
     batch.add_argument("dataset_root")
-    batch.add_argument("--spacing", nargs=3, type=float, default=(1.0, 1.0, 1.0))
+    batch.add_argument("--spacing", nargs=3, type=float, help="array-axis voxel spacing for .npy inputs")
     batch.add_argument("--no-common-region", action="store_true")
     batch.add_argument("--thickness-method", default="hildebrand")
     batch.add_argument("--thickness-backend", default="auto")

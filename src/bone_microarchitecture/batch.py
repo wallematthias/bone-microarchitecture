@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from bone_imaging_derivatives import (
     DerivativeRecord,
     discover_manifests,
     format_progress_event,
+    read_manifest,
     write_manifest,
 )
 from bone_imaging_derivatives.layout import manifest_path, record_output_path
@@ -29,12 +31,26 @@ _FALLBACK_NAMES = {
     "cortical_mask": ("cortical_mask.npy", "cortical.npy"),
     "scan_region_native_common": ("common_region.npy", "common_region_mask.npy"),
 }
+_MAP_ROLES = {
+    "Tb.Th": "trabecular_thickness_map",
+    "Tb.Sp": "trabecular_spacing_map",
+    "Tb.N": "trabecular_number_map",
+    "Ct.Th": "cortical_thickness_map",
+    "Ct.Po.Dm": "cortical_porosity_map",
+}
+
+
+@dataclass(frozen=True)
+class _LoadedVolume:
+    array: np.ndarray
+    spacing: tuple[float, float, float] | None = None
+    sitk_image: object | None = None
 
 
 def run_microarchitecture_batch(
     dataset_root,
     *,
-    spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    spacing: tuple[float, float, float] | None = None,
     use_common_region: bool = True,
     thickness_method: str = "hildebrand",
     thickness_backend: str = "auto",
@@ -54,35 +70,43 @@ def run_microarchitecture_batch(
         raise ValueError("No complete microarchitecture input case was found")
 
     output_records: list[DerivativeRecord] = []
+    measurement_records: list[DerivativeRecord] = []
     for case in cases:
         subject_id, site, session_id, stack_index, space = _case_key(case["bone_segmentation"])
         _emit(progress, subject_id, site, session_id, "measure", "started", "Computing microarchitecture")
-        masks = {role: _load_array(record.path) for role, record in case.items() if role != "transformed_image"}
-        image = _load_array(case["transformed_image"].path)
+        masks = {role: _load_volume(record.path).array for role, record in case.items() if role != "transformed_image"}
+        image = _load_volume(case["transformed_image"].path)
+        case_spacing = image.spacing if image.spacing is not None else spacing
+        if case_spacing is None:
+            raise ValueError("spacing must be supplied for .npy batch inputs without image geometry")
         common = masks.pop("scan_region_native_common", None) if use_common_region else None
         if common is not None:
             common = np.asarray(common) > 0
             masks = {role: (np.asarray(mask) > 0) & common for role, mask in masks.items()}
 
         result = compute_microarchitecture(
-            grayscale=image,
+            grayscale=image.array,
             bone_mask=masks["bone_segmentation"],
             periosteal_mask=masks["periosteal_mask"],
             trabecular_mask=masks["trabecular_mask"],
             cortical_mask=masks.get("cortical_mask"),
-            spacing=spacing,
+            spacing=case_spacing,
             thickness_method=thickness_method,
             thickness_backend=thickness_backend,
         )
         session_part = f"ses-{session_id}" if session_id else "ses-unknown"
         filename = f"sub-{subject_id}_{session_part}_site-{site}_measurements.csv"
         output_path = record_output_path(
-            root, "Microarchitecture", subject_id, site, session_part, "tables", filename
+            root, "Microarchitecture", subject_id, site, "native_space", session_part, "measurements", filename
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         write_measurement_csv(output_path, result.measurements, result.maps)
-        output_records.append(
-            DerivativeRecord(
+        record_metadata = {
+            "use_common_region": common is not None,
+            "thickness_method": thickness_method,
+            "thickness_backend": result.metadata["thickness_backend"],
+        }
+        measurement_record = DerivativeRecord(
                 derivative="Microarchitecture",
                 role="measurements_table",
                 subject_id=subject_id,
@@ -93,22 +117,49 @@ def run_microarchitecture_batch(
                 path=output_path,
                 source="generated",
                 inputs=tuple(record.record_id for record in case.values()),
-                metadata={
-                    "use_common_region": common is not None,
-                    "thickness_method": thickness_method,
-                    "thickness_backend": result.metadata["thickness_backend"],
-                },
+                metadata=record_metadata,
                 content_type="table",
-            )
         )
+        output_records.append(measurement_record)
+        measurement_records.append(measurement_record)
+        for map_name, map_array in result.maps.items():
+            role = _MAP_ROLES.get(map_name)
+            if role is None:
+                continue
+            extension = ".nii.gz" if image.sitk_image is not None else ".npy"
+            map_filename = f"sub-{subject_id}_{session_part}_site-{site}_map-{map_name.lower().replace('.', '-')}{extension}"
+            map_path = record_output_path(
+                root, "Microarchitecture", subject_id, site, "native_space", session_part, "maps", map_filename
+            )
+            _write_map(map_path, map_array, image)
+            output_records.append(
+                DerivativeRecord(
+                    derivative="Microarchitecture",
+                    role=role,
+                    subject_id=subject_id,
+                    site=site,
+                    session_id=session_id,
+                    stack_index=stack_index,
+                    space="native",
+                    path=map_path,
+                    source="generated",
+                    inputs=tuple(record.record_id for record in case.values()),
+                    metadata=record_metadata,
+                    content_type="image",
+                )
+            )
         _emit(progress, subject_id, site, session_id, "measure", "completed", "Wrote measurements", output_path)
 
+    existing_records = _read_existing_records(root)
+    replaced_cases = {_output_case_key(record) for record in output_records}
+    merged_records = [record for record in existing_records if _output_case_key(record) not in replaced_cases]
+    merged_records.extend(output_records)
     manifest = DerivativeManifest.create(
         "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.1.0"},
-        records=tuple(output_records),
+        records=tuple(merged_records),
     )
     write_manifest(manifest, manifest_path(root, "Microarchitecture"))
-    return output_records
+    return measurement_records
 
 
 def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
@@ -169,10 +220,40 @@ def _case_key(record: DerivativeRecord) -> tuple[str, str, str | None, int | Non
     return record.subject_id, record.site, record.session_id, record.stack_index, record.space
 
 
-def _load_array(path: Path) -> np.ndarray:
-    if path.suffix != ".npy":
-        raise ValueError(f"Only .npy inputs are currently supported: {path}")
-    return np.load(path, allow_pickle=False)
+def _load_volume(path: Path) -> _LoadedVolume:
+    if path.suffix == ".npy":
+        return _LoadedVolume(np.load(path, allow_pickle=False))
+    if path.name.endswith((".nii", ".nii.gz")):
+        import SimpleITK as sitk
+
+        image = sitk.ReadImage(str(path))
+        return _LoadedVolume(
+            sitk.GetArrayFromImage(image),
+            tuple(reversed(tuple(float(value) for value in image.GetSpacing()))),
+            image,
+        )
+    raise ValueError(f"Unsupported image format: {path}")
+
+
+def _write_map(path: Path, array: np.ndarray, reference: _LoadedVolume) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if reference.sitk_image is None:
+        np.save(path, np.asarray(array, dtype=np.float32))
+        return
+    import SimpleITK as sitk
+
+    image = sitk.GetImageFromArray(np.asarray(array, dtype=np.float32))
+    image.CopyInformation(reference.sitk_image)
+    sitk.WriteImage(image, str(path))
+
+
+def _read_existing_records(root: Path) -> tuple[DerivativeRecord, ...]:
+    path = manifest_path(root, "Microarchitecture")
+    return read_manifest(path).records if path.exists() else ()
+
+
+def _output_case_key(record: DerivativeRecord) -> tuple[str, str, str | None, int | None]:
+    return record.subject_id, record.site, record.session_id, record.stack_index
 
 
 def _emit(progress, subject_id, site, session_id, step, status, message, path=None) -> None:
