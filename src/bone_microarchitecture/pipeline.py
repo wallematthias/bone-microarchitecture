@@ -106,6 +106,7 @@ def compute_microarchitecture(
         trab_bone,
         trab_region,
         spacing,
+        thickness_method=thickness_method,
         backend=resolved_thickness_backend,
     )
     tb_n = summary(tb_n_map[trab_region])

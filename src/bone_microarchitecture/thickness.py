@@ -131,6 +131,7 @@ def trabecular_number_map(
     domain_mask,
     spacing: tuple[float, float, float],
     *,
+    thickness_method: str = "hildebrand",
     backend: str = "auto",
     material_center_dominance_voxels: float = 0.5,
     spacing_center_dominance_voxels: float = 0.9,
@@ -147,6 +148,9 @@ def trabecular_number_map(
         bone_mask: Trabecular bone phase mask.
         domain_mask: Trabecular compartment mask.
         spacing: Voxel spacing in millimetres, ordered like the array axes.
+        thickness_method: Spacing-field thickness method. ``"hildebrand"`` uses
+            maximal-sphere spacing; ``"edt"`` uses the faster distance-transform
+            approximation.
         backend: Diameter-accumulation backend used for the local spacing field.
         material_center_dominance_voxels: Voxel-scaled dominance threshold for extracting
             trabecular material ridges.
@@ -167,13 +171,19 @@ def trabecular_number_map(
     bone_distance = ndimage.distance_transform_edt(bone, sampling=spacing)
     material_ridge = _medial_axis(bone_distance, float(material_center_dominance_voxels) * min(spacing))
     inter_axis = domain & ~material_ridge
-    spacing_map = hildebrand_thickness_map(
-        inter_axis,
-        spacing,
-        backend=backend,
-        center_dominance_mm=float(spacing_center_dominance_voxels) * min(spacing),
-        diameter_margin_voxels=diameter_margin_voxels,
-    )
+    method = str(thickness_method or "hildebrand").strip().lower()
+    if method == "edt":
+        spacing_map = local_thickness_map(inter_axis, spacing)
+    elif method == "hildebrand":
+        spacing_map = hildebrand_thickness_map(
+            inter_axis,
+            spacing,
+            backend=backend,
+            center_dominance_mm=float(spacing_center_dominance_voxels) * min(spacing),
+            diameter_margin_voxels=diameter_margin_voxels,
+        )
+    else:
+        raise ValueError("Trabecular number thickness_method must be 'hildebrand' or 'edt'.")
     number = np.zeros(domain.shape, dtype=np.float32)
     valid = domain & np.isfinite(spacing_map) & (spacing_map > 0)
     number[valid] = (1.0 / spacing_map[valid]).astype(np.float32, copy=False)

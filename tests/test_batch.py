@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 from dataclasses import replace
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -98,6 +100,54 @@ def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurem
         "trabecular_number_map",
     }
     assert all(record.path.is_file() and "/maps/" in str(record.path) for record in map_records)
+
+
+def test_cli_module_execution_runs_batch(tmp_path):
+    """The module entry point should behave like the console script."""
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    for name, array in {
+        "image": image,
+        "bone": mask,
+        "peri": mask,
+        "trab": mask,
+    }.items():
+        path = tmp_path / "inputs" / f"{name}.npy"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, array)
+    manifest = DerivativeManifest.create(
+        "Segmentation",
+        tmp_path,
+        {"name": "test", "version": "1"},
+        records=(
+            _record(tmp_path, "transformed_image", "inputs/image.npy"),
+            _record(tmp_path, "bone_segmentation", "inputs/bone.npy"),
+            _record(tmp_path, "periosteal_mask", "inputs/peri.npy"),
+            _record(tmp_path, "trabecular_mask", "inputs/trab.npy"),
+        ),
+    )
+    write_manifest(manifest, tmp_path / "derivatives/Segmentation/manifest.json")
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "bone_microarchitecture.cli",
+            "run-batch",
+            str(tmp_path),
+            "--spacing",
+            "1",
+            "1",
+            "1",
+            "--thickness-method",
+            "edt",
+            "--thickness-backend",
+            "cpu",
+        ],
+        check=True,
+    )
+
+    assert (tmp_path / "derivatives" / "Microarchitecture" / "manifest.json").exists()
 
 
 def test_batch_excludes_unused_common_region_from_provenance(tmp_path):
