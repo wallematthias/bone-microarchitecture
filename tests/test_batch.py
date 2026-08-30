@@ -11,7 +11,7 @@ import pytest
 from bone_imaging_derivatives import DerivativeManifest, DerivativeRecord, read_manifest, write_manifest
 
 
-def _record(root, role, path, *, derivative="Segmentation"):
+def _record(root, role, path, *, derivative="Segmentation", source="provided", content_type=None, metadata=None):
     return DerivativeRecord(
         derivative=derivative,
         role=role,
@@ -21,8 +21,9 @@ def _record(root, role, path, *, derivative="Segmentation"):
         stack_index=None,
         space="native",
         path=root / path,
-        source="provided",
-        content_type="image" if role == "transformed_image" else "mask",
+        source=source,
+        content_type=content_type or ("image" if role in {"transformed_image", "source_image_view"} else "mask"),
+        metadata=metadata or {},
     )
 
 
@@ -100,6 +101,60 @@ def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurem
         "trabecular_number_map",
     }
     assert all(record.path.is_file() and "/maps/" in str(record.path) for record in map_records)
+
+
+def test_batch_loads_virtual_aim_source_image_view(monkeypatch, tmp_path):
+    """Batch mode should not require Timelapsed to materialize split grayscale stack NIfTIs."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    for name in ("bone", "peri", "trab"):
+        path = tmp_path / f"{name}.npy"
+        np.save(path, mask)
+
+    source = tmp_path / "raw" / "scan.AIM"
+    calls = []
+
+    def fake_load_virtual(record):
+        calls.append(record.path)
+        return batch._LoadedVolume(image, (0.061, 0.061, 0.061), None)
+
+    monkeypatch.setattr(batch, "_load_virtual_image_record", fake_load_virtual)
+    write_manifest(
+        DerivativeManifest.create(
+            "Segmentation",
+            tmp_path,
+            {"name": "test", "version": "1"},
+            records=(
+                _record(
+                    tmp_path,
+                    "source_image_view",
+                    source,
+                    source="virtual",
+                    content_type="image",
+                    metadata={
+                        "format": "AIM",
+                        "view_type": "stack_slices",
+                        "slice_axis": "z",
+                        "slice_start": 0,
+                        "slice_stop": 4,
+                        "source_image": str(source),
+                        "scaling": "bmd",
+                    },
+                ),
+                _record(tmp_path, "bone_segmentation", "bone.npy"),
+                _record(tmp_path, "periosteal_mask", "peri.npy"),
+                _record(tmp_path, "trabecular_mask", "trab.npy"),
+            ),
+        ),
+        tmp_path / "derivatives/Segmentation/manifest.json",
+    )
+
+    records = batch.run_microarchitecture_batch(tmp_path, thickness_backend="cpu")
+
+    assert records
+    assert calls == [source]
 
 
 def test_cli_module_execution_runs_batch(tmp_path):
