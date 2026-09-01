@@ -84,6 +84,29 @@ def test_trabecular_number_map_is_zero_outside_domain():
     assert np.count_nonzero(result[domain]) > 0
 
 
+def test_trabecular_number_edt_method_does_not_call_hildebrand(monkeypatch):
+    import bone_microarchitecture.thickness as thickness
+
+    def fail_hildebrand(*_args, **_kwargs):
+        raise AssertionError("EDT trabecular number should not call Hildebrand")
+
+    monkeypatch.setattr(thickness, "hildebrand_thickness_map", fail_hildebrand)
+    domain = np.zeros((5, 5, 5), dtype=bool)
+    domain[1:4, 1:4, 1:4] = True
+    bone = np.zeros_like(domain)
+    bone[2, 2, 2] = True
+
+    result = trabecular_number_map(
+        bone,
+        domain,
+        (1.0, 1.0, 1.0),
+        thickness_method="edt",
+        backend="cpu",
+    )
+
+    assert np.count_nonzero(result[domain]) > 0
+
+
 def test_summary_ignores_zero_negative_and_nonfinite_values():
     values = np.array([0.0, -1.0, 1.0, 3.0, np.nan, np.inf])
 

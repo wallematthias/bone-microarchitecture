@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 from .opencl import opencl_hildebrand_thickness_map
+from .batch import run_microarchitecture_batch
 from .pipeline import compute_microarchitecture
 from .results import MicroarchitectureResult, PARAMETER_DEFINITIONS
 from .thickness import (
@@ -24,6 +25,7 @@ __all__ = [
     "PARAMETER_DEFINITIONS",
     "__version__",
     "compute_microarchitecture",
+    "run_microarchitecture_batch",
     "default_thickness_backend",
     "hildebrand_thickness_map",
     "local_thickness_map",

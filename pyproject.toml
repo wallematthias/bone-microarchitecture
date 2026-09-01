@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bone-microarchitecture"
-version = "0.1.0"
+version = "0.2.2"
 description = "Lightweight bone microarchitecture measurements from masks and calibrated grayscale arrays."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,9 +22,14 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
+  "bone-imaging-derivatives>=0.1.1",
   "numpy>=1.23",
+  "SimpleITK>=2.2",
   "scipy>=1.10",
 ]
+
+[project.scripts]
+bone-microarchitecture = "bone_microarchitecture.cli:main"
 
 [project.optional-dependencies]
 test = [
