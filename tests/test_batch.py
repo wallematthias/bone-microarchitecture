@@ -27,6 +27,39 @@ def _record(root, role, path, *, derivative="Segmentation", source="provided", c
     )
 
 
+def _write_case(root, *, subject_id="SAMPLE001", site="tibia", session_id="1"):
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    paths = {
+        "transformed_image": f"inputs/sub-{subject_id}_ses-{session_id}_site-{site}_image.npy",
+        "bone_segmentation": f"inputs/sub-{subject_id}_ses-{session_id}_site-{site}_bone.npy",
+        "periosteal_mask": f"inputs/sub-{subject_id}_ses-{session_id}_site-{site}_peri.npy",
+        "trabecular_mask": f"inputs/sub-{subject_id}_ses-{session_id}_site-{site}_trab.npy",
+    }
+    for role, path_text in paths.items():
+        path = root / path_text
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, image if role == "transformed_image" else mask)
+    manifest_path = root / "derivatives" / f"Segmentation-{subject_id}-{site}-{session_id}" / "manifest.json"
+    write_manifest(
+        DerivativeManifest.create(
+            "Segmentation",
+            root,
+            {"name": "test", "version": "1"},
+            records=tuple(
+                replace(
+                    _record(root, role, path_text, derivative="Registration" if role == "transformed_image" else "Segmentation"),
+                    subject_id=subject_id,
+                    site=site,
+                    session_id=session_id,
+                )
+                for role, path_text in paths.items()
+            ),
+        ),
+        manifest_path,
+    )
+
+
 def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurement_manifest(tmp_path):
     """A missing common-region intersection would inflate the exported Tb.TV."""
     from bone_microarchitecture.batch import run_microarchitecture_batch
@@ -203,6 +236,101 @@ def test_cli_module_execution_runs_batch(tmp_path):
     )
 
     assert (tmp_path / "derivatives" / "Microarchitecture" / "manifest.json").exists()
+
+
+def test_batch_filters_cases_by_subject_site_and_session(tmp_path):
+    from bone_microarchitecture.batch import run_microarchitecture_batch
+
+    _write_case(tmp_path, subject_id="SAMPLE001", site="radius", session_id="1")
+    _write_case(tmp_path, subject_id="SAMPLE001", site="radius", session_id="2")
+    _write_case(tmp_path, subject_id="SAMPLE001", site="tibia", session_id="1")
+
+    records = run_microarchitecture_batch(
+        tmp_path,
+        spacing=(1.0, 1.0, 1.0),
+        subject_id="SAMPLE001",
+        site="radius",
+        session_id="2",
+        thickness_method="edt",
+        thickness_backend="cpu",
+    )
+
+    measurement_records = [record for record in records if record.role == "measurements_table"]
+    assert len(measurement_records) == 1
+    assert measurement_records[0].subject_id == "SAMPLE001"
+    assert measurement_records[0].site == "radius"
+    assert measurement_records[0].session_id == "2"
+
+
+def test_batch_filters_accept_site_alias_from_slicer_ui(tmp_path):
+    """UI aliases such as radius_left and 00 must match parsed STRAMBO cases."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
+    mask_dir = tmp_path / "derivatives" / "Segmentation" / "sub-STRAMBO_0001" / "site-radius" / "ses-Y00" / "masks"
+    mask_dir.mkdir(parents=True)
+    for role in ("seg", "full", "trab"):
+        np.save(mask_dir / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
+
+    cases = batch._filter_cases(batch._discover_cases(tmp_path), subject_id="STRAMBO_0001", site="radius_left", session_id="00")
+
+    assert len(cases) == 1
+    assert cases[0]["bone_segmentation"].site == "radius_left"
+
+
+def test_run_batch_treats_selected_derivatives_folder_as_dataset_root(tmp_path):
+    """Selecting derivatives in a GUI must not turn outputs into derivatives/derivatives."""
+    from bone_microarchitecture.batch import run_microarchitecture_batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
+    mask_dir = tmp_path / "derivatives" / "Segmentation" / "sub-STRAMBO_0001" / "site-radius" / "ses-Y00" / "masks"
+    mask_dir.mkdir(parents=True)
+    for role in ("seg", "full", "trab"):
+        np.save(mask_dir / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
+
+    records = run_microarchitecture_batch(
+        tmp_path / "derivatives",
+        spacing=(1.0, 1.0, 1.0),
+        subject_id="STRAMBO_0001",
+        site="radius_left",
+        session_id="00",
+        thickness_method="edt",
+        thickness_backend="cpu",
+    )
+
+    assert records
+    assert (tmp_path / "derivatives" / "Microarchitecture" / "manifest.json").is_file()
+    assert not (tmp_path / "derivatives" / "derivatives").exists()
+
+
+def test_cli_run_batch_accepts_case_filters(tmp_path, monkeypatch):
+    from bone_microarchitecture import cli
+
+    received = {}
+
+    def fake_run_microarchitecture_batch(dataset_root, **kwargs):
+        received.update(dataset_root=dataset_root, **kwargs)
+        return []
+
+    monkeypatch.setattr(cli, "run_microarchitecture_batch", fake_run_microarchitecture_batch)
+
+    assert cli.main([
+        "run-batch",
+        str(tmp_path),
+        "--subject",
+        "SAMPLE001",
+        "--site",
+        "radius",
+        "--session",
+        "2",
+    ]) == 0
+    assert received["subject_id"] == "SAMPLE001"
+    assert received["site"] == "radius"
+    assert received["session_id"] == "2"
 
 
 def test_batch_excludes_unused_common_region_from_provenance(tmp_path):
@@ -391,6 +519,83 @@ def test_cli_npy_without_spacing_reaches_clear_batch_validation(tmp_path):
 
     with pytest.raises(ValueError, match=r"spacing.*\.npy"):
         main(["run-batch", str(tmp_path), "--thickness-method", "edt", "--thickness-backend", "cpu"])
+
+
+def test_batch_discovers_root_images_with_derivative_segmentation_masks(tmp_path):
+    """Microarchitecture batch should pair root scans with Bone Contouring masks in derivatives."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
+    mask_dir = tmp_path / "derivatives" / "Segmentation" / "sub-STRAMBO_0001" / "site-radius" / "ses-Y00" / "masks"
+    mask_dir.mkdir(parents=True)
+    for role in ("seg", "full", "trab", "cort"):
+        np.save(mask_dir / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert len(cases) == 1
+    assert cases[0]["transformed_image"].path.name == "STRAMBO_0001_RL_Y00_image.npy"
+    assert cases[0]["bone_segmentation"].path.name == "STRAMBO_0001_RL_Y00_mask-seg.npy"
+    assert cases[0]["periosteal_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-full.npy"
+    assert cases[0]["trabecular_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-trab.npy"
+    assert cases[0]["cortical_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-cort.npy"
+
+
+def test_batch_discovers_scanco_style_masks_beside_root_scan(tmp_path):
+    """Native Scanco mask exports beside the image should be valid batch inputs too."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
+    for role in ("seg", "full", "trab"):
+        np.save(tmp_path / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert len(cases) == 1
+    assert cases[0]["bone_segmentation"].path.name == "STRAMBO_0001_RL_Y00_mask-seg.npy"
+    assert cases[0]["periosteal_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-full.npy"
+    assert cases[0]["trabecular_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-trab.npy"
+
+
+def test_batch_discovers_bare_scanco_aim_scan_with_aim_masks(tmp_path):
+    """Bare STRAMBO AIM names should pair with root Scanco masks without a manifest."""
+    from bone_microarchitecture import batch
+
+    (tmp_path / "STRAMBO_0001_RL_Y00.AIM").write_bytes(b"aim")
+    for role in ("seg", "full", "trab"):
+        (tmp_path / f"STRAMBO_0001_RL_Y00_mask-{role}.AIM").write_bytes(b"aim-mask")
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert len(cases) == 1
+    assert cases[0]["transformed_image"].path.name == "STRAMBO_0001_RL_Y00.AIM"
+    assert cases[0]["transformed_image"].site == "radius_left"
+    assert cases[0]["transformed_image"].session_id == "Y00"
+    assert cases[0]["bone_segmentation"].path.name == "STRAMBO_0001_RL_Y00_mask-seg.AIM"
+    assert cases[0]["periosteal_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-full.AIM"
+    assert cases[0]["trabecular_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-trab.AIM"
+
+
+def test_batch_discovery_preserves_left_and_right_site_identity(tmp_path):
+    """Left and right scans must not collapse into one generic radius case."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    for side in ("RL", "RR"):
+        np.save(tmp_path / f"STRAMBO_0001_{side}_Y00_image.npy", image)
+        mask_dir = tmp_path / "derivatives" / "Segmentation" / "sub-STRAMBO_0001" / "site-radius" / "ses-Y00" / "masks"
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        for role in ("seg", "full", "trab"):
+            np.save(mask_dir / f"STRAMBO_0001_{side}_Y00_mask-{role}.npy", mask)
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert sorted(case["bone_segmentation"].site for case in cases) == ["radius_left", "radius_right"]
 
 
 def test_batch_reuses_compatible_records_and_recomputes_when_settings_or_inputs_change(tmp_path, monkeypatch):

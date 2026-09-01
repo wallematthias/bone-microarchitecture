@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="resources/bone-microarchitecture.png" alt="bone-microarchitecture icon" width="240">
+</p>
+
 # Bone Microarchitecture
 
 Lightweight microarchitecture measurements from binary masks and optional calibrated grayscale arrays.
+
+Author: Matthias Walle.
 
 This package intentionally has no Slicer dependency and no image I/O dependency. Callers are responsible for loading images, calibration, and putting masks on a common grid.
 

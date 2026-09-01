@@ -60,6 +60,9 @@ def run_microarchitecture_batch(
     force: bool = False,
     thickness_method: str = "hildebrand",
     thickness_backend: str = "auto",
+    subject_id: str = "",
+    site: str = "",
+    session_id: str = "",
     progress: Callable[[DerivativeProgressEvent], None] | None = None,
 ) -> list[DerivativeRecord]:
     """Measure every manifest-discovered case and write Microarchitecture outputs.
@@ -70,8 +73,9 @@ def run_microarchitecture_batch(
     Simple, unambiguous ``.npy`` filenames are accepted when manifests are not
     yet available, primarily for lightweight command-line workflows.
     """
-    root = Path(dataset_root).resolve()
+    root = _dataset_root(Path(dataset_root).resolve())
     cases = _discover_cases(root)
+    cases = _filter_cases(cases, subject_id=subject_id, site=site, session_id=session_id)
     if not cases:
         raise ValueError("No complete microarchitecture input case was found")
 
@@ -189,8 +193,33 @@ def run_microarchitecture_batch(
     return measurement_records
 
 
+def _filter_cases(cases, *, subject_id: str = "", site: str = "", session_id: str = ""):
+    subject_id = str(subject_id or "").strip()
+    site = _filter_site(site)
+    session_id = str(session_id or "").strip()
+    if not subject_id and not site and not session_id:
+        return list(cases)
+    filtered = []
+    for case in cases:
+        case_subject, case_site, case_session, _stack_index, _space = _case_key(case["bone_segmentation"])
+        if subject_id and str(case_subject) != subject_id:
+            continue
+        if site and not _sites_match(case_site, site):
+            continue
+        if session_id and _session_key(case_session) != _session_key(session_id):
+            continue
+        filtered.append(case)
+    return filtered
+
+
+def _dataset_root(root: Path) -> Path:
+    return root.parent if root.name == "derivatives" else root
+
+
 def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
     records = [record for manifest in discover_manifests(root) for record in manifest.records]
+    records.extend(_discover_structured_input_records(root))
+    records = list(_deduplicate_records(records))
     cases: list[dict[str, DerivativeRecord]] = []
     for bone in (record for record in records if record.role == "bone_segmentation"):
         key = _case_key(bone)
@@ -207,6 +236,231 @@ def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
         if all(role in case for role in (*_REQUIRED_ROLES, "transformed_image")):
             cases.append(case)
     return cases or _fallback_case(root)
+
+
+def _deduplicate_records(records):
+    seen = set()
+    for record in records:
+        key = (
+            record.role,
+            record.subject_id,
+            record.site,
+            record.session_id,
+            record.stack_index,
+            record.space,
+            Path(record.path).resolve(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        yield record
+
+
+def _discover_structured_input_records(root: Path) -> list[DerivativeRecord]:
+    """Discover raw scans and masks from lightweight on-disk conventions.
+
+    This complements manifest discovery for two common cases: Scanco masks kept
+    beside the source image, and Bone Contouring outputs under
+    ``derivatives/Segmentation`` before a shared manifest has been written.
+    """
+    records: list[DerivativeRecord] = []
+    for path in sorted(path for path in root.iterdir() if path.is_file() and _is_supported_volume(path)):
+        parsed = _parse_structured_path(root, path)
+        if parsed is None:
+            continue
+        role, subject_id, site, session_id, stack_index = parsed
+        derivative = "Segmentation" if role != "transformed_image" else "Registration"
+        records.append(
+            _structured_record(root, path, derivative, role, subject_id, site, session_id, stack_index)
+        )
+
+    segmentation_root = root / "derivatives" / "Segmentation"
+    if segmentation_root.exists():
+        for path in sorted(path for path in segmentation_root.rglob("*") if path.is_file() and _is_supported_volume(path)):
+            parsed = _parse_structured_path(root, path)
+            if parsed is None:
+                continue
+            role, subject_id, site, session_id, stack_index = parsed
+            if role == "transformed_image":
+                continue
+            records.append(
+                _structured_record(root, path, "Segmentation", role, subject_id, site, session_id, stack_index)
+            )
+    return records
+
+
+def _structured_record(
+    root: Path,
+    path: Path,
+    derivative: str,
+    role: str,
+    subject_id: str,
+    site: str,
+    session_id: str | None,
+    stack_index: int | None,
+) -> DerivativeRecord:
+    return DerivativeRecord(
+        derivative=derivative,
+        role=role,
+        subject_id=subject_id,
+        site=site,
+        session_id=session_id,
+        stack_index=stack_index,
+        space="native",
+        path=path,
+        source="provided",
+        content_type="image" if role == "transformed_image" else "mask",
+    )
+
+
+def _parse_structured_path(root: Path, path: Path) -> tuple[str, str, str, str | None, int | None] | None:
+    role = _role_from_filename(path)
+    if role is None:
+        return None
+    subject_id, site, session_id, stack_index = _metadata_from_path_parts(root, path)
+    filename_metadata = _metadata_from_filename(path)
+    subject_id = subject_id or filename_metadata.get("subject_id", "")
+    filename_site = filename_metadata.get("site", "")
+    if filename_site and (_is_generic_site(site) or not site):
+        site = filename_site
+    else:
+        site = site or filename_site
+    session_id = session_id or filename_metadata.get("session_id")
+    if not subject_id or not site:
+        return None
+    return role, subject_id, site, session_id, stack_index
+
+
+def _metadata_from_path_parts(root: Path, path: Path) -> tuple[str, str, str | None, int | None]:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    subject_id = ""
+    site = ""
+    session_id = None
+    stack_index = None
+    for part in parts:
+        if part.startswith("sub-"):
+            subject_id = part[4:]
+        elif part.startswith("site-"):
+            site = _canonical_site(part[5:])
+        elif part.startswith("ses-"):
+            session_id = part[4:]
+        elif part.startswith("stack-"):
+            try:
+                stack_index = int(part[6:])
+            except ValueError:
+                stack_index = None
+    return subject_id, site, session_id, stack_index
+
+
+def _metadata_from_filename(path: Path) -> dict[str, str]:
+    stem = _volume_stem(path)
+    metadata: dict[str, str] = {}
+    bids = re.search(r"(?:^|_)sub-([^_]+).*?(?:^|_)ses-([^_]+).*?(?:^|_)site-([^_]+)", stem)
+    if bids:
+        metadata["subject_id"] = bids.group(1)
+        metadata["session_id"] = bids.group(2)
+        metadata["site"] = _canonical_site(bids.group(3))
+        return metadata
+    strambo = re.match(r"(STRAMBO_\d+)_([A-Za-z]{2})_Y?(\d+)", stem)
+    if strambo:
+        metadata["subject_id"] = strambo.group(1)
+        metadata["site"] = _canonical_site(strambo.group(2))
+        metadata["session_id"] = f"Y{strambo.group(3)}" if "_Y" in stem else strambo.group(3)
+    return metadata
+
+
+def _role_from_filename(path: Path) -> str | None:
+    stem = _volume_stem(path).lower()
+    if re.search(r"(?:^|[_-])mask[_-]?seg(?:$|[_-])", stem) or re.search(r"(?:^|[_-])seg(?:$|[_-])", stem):
+        return "bone_segmentation"
+    if re.search(r"(?:^|[_-])mask[_-]?full(?:$|[_-])", stem) or "full_mask" in stem or "periosteal" in stem:
+        return "periosteal_mask"
+    if re.search(r"(?:^|[_-])mask[_-]?trab(?:$|[_-])", stem) or "trabecular" in stem:
+        return "trabecular_mask"
+    if re.search(r"(?:^|[_-])mask[_-]?cort(?:$|[_-])", stem) or "cortical" in stem:
+        return "cortical_mask"
+    if re.search(r"(?:^|[_-])(image|scan|source)(?:$|[_-])", stem):
+        return "transformed_image"
+    if (
+        not re.search(r"(?:^|[_-])(mask|seg|full|trab|cort|map|label)(?:$|[_-])", stem)
+        and _volume_name(path).lower().endswith((".aim", ".isq"))
+    ):
+        return "transformed_image"
+    return None
+
+
+def _canonical_site(site: str) -> str:
+    normalized = str(site or "").strip().lower()
+    aliases = {
+        "rl": "radius_left",
+        "rr": "radius_right",
+        "tl": "tibia_left",
+        "tr": "tibia_right",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _filter_site(site: str) -> str:
+    normalized = str(site or "").strip().lower()
+    return {
+        "rl": "radius_left",
+        "rr": "radius_right",
+        "tl": "tibia_left",
+        "tr": "tibia_right",
+    }.get(normalized, normalized)
+
+
+def _sites_match(case_site: str, requested_site: str) -> bool:
+    case_site = _filter_site(case_site)
+    requested_site = _filter_site(requested_site)
+    if not requested_site:
+        return True
+    if case_site == requested_site:
+        return True
+    return _site_family(case_site) == requested_site or _site_family(requested_site) == case_site
+
+
+def _site_family(site: str) -> str:
+    normalized = str(site or "").strip().lower()
+    if normalized.startswith("radius"):
+        return "radius"
+    if normalized.startswith("tibia"):
+        return "tibia"
+    return normalized
+
+
+def _is_generic_site(site: str) -> bool:
+    return str(site or "").strip().lower() in {"", "radius", "tibia", "knee"}
+
+
+def _session_key(session_id) -> str:
+    value = str(session_id or "").strip()
+    upper = value.upper()
+    if upper.startswith("SES-"):
+        upper = upper[4:]
+    if upper.startswith("Y") and upper[1:].isdigit():
+        upper = upper[1:]
+    return upper.lstrip("0") or "0"
+
+
+def _volume_stem(path: Path) -> str:
+    name = _volume_name(path)
+    lower = name.lower()
+    for suffix in (".nii.gz", ".npy", ".aim", ".isq", ".nii"):
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def _is_supported_volume(path: Path) -> bool:
+    return _volume_name(path).lower().endswith((".npy", ".nii", ".nii.gz", ".aim", ".isq"))
+
+
+def _volume_name(path: Path) -> str:
+    return path.name.split(";", 1)[0]
 
 
 def _matching_record(records, role: str, key):
@@ -247,7 +501,7 @@ def _case_key(record: DerivativeRecord) -> tuple[str, str, str | None, int | Non
     return record.subject_id, record.site, record.session_id, record.stack_index, record.space
 
 
-def _load_volume(path: Path) -> _LoadedVolume:
+def _load_volume(path: Path, *, scaling: str = "bmd") -> _LoadedVolume:
     if path.suffix == ".npy":
         return _LoadedVolume(np.load(path, allow_pickle=False))
     if path.name.endswith((".nii", ".nii.gz")):
@@ -259,13 +513,39 @@ def _load_volume(path: Path) -> _LoadedVolume:
             tuple(reversed(tuple(float(value) for value in image.GetSpacing()))),
             image,
         )
+    if _volume_name(path).lower().endswith(".aim"):
+        return _load_aim_volume(path, scaling=scaling)
     raise ValueError(f"Unsupported image format: {path}")
 
 
 def _load_record_volume(record: DerivativeRecord) -> _LoadedVolume:
     if record.source == "virtual" and record.role == "source_image_view":
         return _load_virtual_image_record(record)
-    return _load_volume(record.path)
+    scaling = "bmd" if record.content_type == "image" else "native"
+    return _load_volume(record.path, scaling=scaling)
+
+
+def _load_aim_volume(path: Path, *, scaling: str = "bmd") -> _LoadedVolume:
+    try:
+        import py_aimio
+        import SimpleITK as sitk
+    except ImportError as exc:
+        raise RuntimeError("AIM batch inputs require aimio-py and SimpleITK.") from exc
+
+    array, metadata = py_aimio.read_aim(str(path), density=False, hu=False)
+    array = _aim_array_zyx(np.asarray(array), metadata)
+    processing_log = str(metadata.get("processing_log_raw") or metadata.get("processing_log", ""))
+    array = _scale_aim_array(array, processing_log, scaling)
+    image = sitk.GetImageFromArray(array)
+    spacing_xyz = _aim_spacing_xyz(metadata)
+    image.SetSpacing(spacing_xyz)
+    image.SetOrigin(_aim_origin_xyz(metadata, spacing_xyz))
+    image.SetDirection((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    return _LoadedVolume(
+        sitk.GetArrayFromImage(image),
+        tuple(reversed(tuple(float(value) for value in image.GetSpacing()))),
+        image,
+    )
 
 
 def _load_virtual_image_record(record: DerivativeRecord) -> _LoadedVolume:
