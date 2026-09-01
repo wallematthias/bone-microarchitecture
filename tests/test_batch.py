@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import replace
+import json
 import subprocess
 import sys
 
@@ -543,6 +544,103 @@ def test_batch_discovers_root_images_with_derivative_segmentation_masks(tmp_path
     assert cases[0]["cortical_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-cort.npy"
 
 
+def test_batch_discovery_ignores_timelapsed_outputs_as_individual_inputs(tmp_path):
+    """Timelapsed fused outputs should not duplicate native microarchitecture cases."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
+    for role in ("seg", "full", "trab"):
+        np.save(tmp_path / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
+    fused_dir = tmp_path / "derivatives" / "TimelapsedHRpQCT" / "sub-STRAMBO_0001" / "site-radius_left" / "ses-00" / "stacks"
+    fused_dir.mkdir(parents=True)
+    fused_image = fused_dir / "sub-STRAMBO_0001_site-radius_left_ses-00_image_fused.npy"
+    fused_seg = fused_dir / "sub-STRAMBO_0001_site-radius_left_ses-00_stack-01_seg.npy"
+    np.save(fused_image, image)
+    np.save(fused_seg, mask)
+    write_manifest(
+        DerivativeManifest.create(
+            "Timelapsed",
+            tmp_path,
+            {"name": "timelapsed", "version": "test"},
+            records=(
+                DerivativeRecord(
+                    "Timelapsed",
+                    "transformed_image",
+                    "STRAMBO_0001",
+                    "radius_left",
+                    "00",
+                    1,
+                    "native",
+                    fused_image,
+                    "generated",
+                    content_type="image",
+                ),
+                DerivativeRecord(
+                    "Timelapsed",
+                    "bone_segmentation",
+                    "STRAMBO_0001",
+                    "radius_left",
+                    "00",
+                    1,
+                    "native",
+                    fused_seg,
+                    "generated",
+                    content_type="mask",
+                ),
+            ),
+        ),
+        tmp_path / "derivatives" / "Timelapsed" / "manifest.json",
+    )
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert len(cases) == 1
+    assert cases[0]["transformed_image"].path.name == "STRAMBO_0001_RL_Y00_image.npy"
+
+
+def test_batch_discovery_does_not_use_measurement_maps_as_grayscale_inputs(tmp_path):
+    """Previously written microarchitecture maps are outputs, not input images."""
+    from bone_microarchitecture import batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
+    for role in ("seg", "full", "trab"):
+        np.save(tmp_path / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
+    map_path = tmp_path / "derivatives" / "Microarchitecture" / "sub-STRAMBO_0001" / "site-radius_left" / "native_space" / "ses-00" / "maps" / "tb-th.npy"
+    map_path.parent.mkdir(parents=True)
+    np.save(map_path, image)
+    write_manifest(
+        DerivativeManifest.create(
+            "Microarchitecture",
+            tmp_path,
+            {"name": "bone-microarchitecture", "version": "test"},
+            records=(
+                DerivativeRecord(
+                    "Microarchitecture",
+                    "trabecular_thickness_map",
+                    "STRAMBO_0001",
+                    "radius_left",
+                    "00",
+                    None,
+                    "native",
+                    map_path,
+                    "generated",
+                    content_type="image",
+                ),
+            ),
+        ),
+        tmp_path / "derivatives" / "Microarchitecture" / "manifest.json",
+    )
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert len(cases) == 1
+    assert cases[0]["transformed_image"].path.name == "STRAMBO_0001_RL_Y00_image.npy"
+
+
 def test_batch_discovers_scanco_style_masks_beside_root_scan(tmp_path):
     """Native Scanco mask exports beside the image should be valid batch inputs too."""
     from bone_microarchitecture import batch
@@ -561,6 +659,46 @@ def test_batch_discovers_scanco_style_masks_beside_root_scan(tmp_path):
     assert cases[0]["trabecular_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-trab.npy"
 
 
+def test_batch_discovers_sidecar_described_non_aim_inputs(tmp_path):
+    """Shared discovery lets non-AIM files participate when metadata lives in sidecars."""
+    from bone_microarchitecture import batch
+
+    image = tmp_path / "baseline_scan.nii.gz"
+    image.write_bytes(b"nifti")
+    image.with_name("baseline_scan.json").write_text(
+        json.dumps({"subject_id": "S01", "session_id": "baseline", "site": "tibia_right"})
+    )
+    mask_dir = tmp_path / "derivatives" / "Segmentation" / "unstructured"
+    mask_dir.mkdir(parents=True)
+    for name, role in {
+        "mineralized.nii.gz": "segmentation",
+        "outer-roi.nii.gz": "full",
+        "inner-roi.nii.gz": "trab",
+    }.items():
+        path = mask_dir / name
+        path.write_bytes(b"mask")
+        path.with_name(f"{name}.json").write_text(
+            json.dumps({
+                "subject_id": "S01",
+                "session_id": "baseline",
+                "site": "tibia_right",
+                "role": role,
+            })
+        )
+
+    cases = batch._discover_cases(tmp_path)
+
+    assert len(cases) == 1
+    case = cases[0]
+    assert case["transformed_image"].path.name == "baseline_scan.nii.gz"
+    assert case["bone_segmentation"].path.name == "mineralized.nii.gz"
+    assert case["periosteal_mask"].path.name == "outer-roi.nii.gz"
+    assert case["trabecular_mask"].path.name == "inner-roi.nii.gz"
+    assert case["bone_segmentation"].subject_id == "S01"
+    assert case["bone_segmentation"].session_id == "baseline"
+    assert case["bone_segmentation"].site == "tibia_right"
+
+
 def test_batch_discovers_bare_scanco_aim_scan_with_aim_masks(tmp_path):
     """Bare STRAMBO AIM names should pair with root Scanco masks without a manifest."""
     from bone_microarchitecture import batch
@@ -574,7 +712,7 @@ def test_batch_discovers_bare_scanco_aim_scan_with_aim_masks(tmp_path):
     assert len(cases) == 1
     assert cases[0]["transformed_image"].path.name == "STRAMBO_0001_RL_Y00.AIM"
     assert cases[0]["transformed_image"].site == "radius_left"
-    assert cases[0]["transformed_image"].session_id == "Y00"
+    assert cases[0]["transformed_image"].session_id == "00"
     assert cases[0]["bone_segmentation"].path.name == "STRAMBO_0001_RL_Y00_mask-seg.AIM"
     assert cases[0]["periosteal_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-full.AIM"
     assert cases[0]["trabecular_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-trab.AIM"

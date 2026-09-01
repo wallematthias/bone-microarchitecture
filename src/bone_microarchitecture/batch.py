@@ -14,8 +14,11 @@ from bone_imaging_derivatives import (
     DerivativeManifest,
     DerivativeProgressEvent,
     DerivativeRecord,
+    discover_artifacts,
     discover_manifests,
     format_progress_event,
+    normalize_session_id,
+    normalize_site,
     read_manifest,
     write_manifest,
 )
@@ -42,6 +45,15 @@ _MAP_ROLES = {
     "Ct.Po.Dm": "cortical_porosity_map",
     "Tb.BMD": "material_map",
     "Ct.BMD": "material_map",
+}
+_DISCOVERY_ROLE_MAP = {
+    "image": "transformed_image",
+    "segmentation": "bone_segmentation",
+    "full": "periosteal_mask",
+    "trab": "trabecular_mask",
+    "cort": "cortical_mask",
+    "scan_region_native_common": "scan_region_native_common",
+    "common_region": "scan_region_native_common",
 }
 
 
@@ -218,6 +230,7 @@ def _dataset_root(root: Path) -> Path:
 
 def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
     records = [record for manifest in discover_manifests(root) for record in manifest.records]
+    records.extend(_discover_shared_artifact_records(root))
     records.extend(_discover_structured_input_records(root))
     records = list(_deduplicate_records(records))
     cases: list[dict[str, DerivativeRecord]] = []
@@ -236,6 +249,64 @@ def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
         if all(role in case for role in (*_REQUIRED_ROLES, "transformed_image")):
             cases.append(case)
     return cases or _fallback_case(root)
+
+
+def _discover_shared_artifact_records(root: Path) -> list[DerivativeRecord]:
+    """Convert shared artifact discovery records into microarchitecture inputs."""
+    index = discover_artifacts(root, include_derivatives=True)
+    records: list[DerivativeRecord] = []
+    for artifact in index.records:
+        if not _artifact_is_microarchitecture_input_source(root, artifact.path):
+            continue
+        role = _DISCOVERY_ROLE_MAP.get(artifact.role)
+        if role is None:
+            continue
+        if role == "transformed_image" and artifact.kind != "image":
+            continue
+        if role != "transformed_image" and artifact.kind != "mask":
+            continue
+        if not artifact.subject_id or not artifact.site:
+            continue
+        derivative = "Registration" if role == "transformed_image" else "Segmentation"
+        records.append(
+            DerivativeRecord(
+                derivative=derivative,
+                role=role,
+                subject_id=artifact.subject_id,
+                site=artifact.site,
+                session_id=artifact.session_id,
+                stack_index=artifact.stack_index,
+                space="native",
+                path=artifact.path,
+                source="provided",
+                content_type="image" if role == "transformed_image" else "mask",
+                metadata={
+                    "discovery": {
+                        "format": artifact.format,
+                        "identity_confidence": artifact.identity_confidence,
+                        "subject_source": artifact.subject_source,
+                        "session_source": artifact.session_source,
+                        "site_source": artifact.site_source,
+                        "role_source": artifact.role_source,
+                    }
+                },
+            )
+        )
+    return records
+
+
+def _artifact_is_microarchitecture_input_source(root: Path, path: Path) -> bool:
+    try:
+        parts = [part.lower().replace("-", "_") for part in Path(path).resolve().relative_to(root).parts]
+    except ValueError:
+        return True
+    if "derivatives" not in parts:
+        return True
+    index = parts.index("derivatives")
+    if index + 1 >= len(parts):
+        return False
+    family = parts[index + 1]
+    return family in {"segmentation", "registration", "calibration", "commonregion", "common_region"}
 
 
 def _deduplicate_records(records):
@@ -346,7 +417,7 @@ def _metadata_from_path_parts(root: Path, path: Path) -> tuple[str, str, str | N
         elif part.startswith("site-"):
             site = _canonical_site(part[5:])
         elif part.startswith("ses-"):
-            session_id = part[4:]
+            session_id = normalize_session_id(part[4:])
         elif part.startswith("stack-"):
             try:
                 stack_index = int(part[6:])
@@ -361,14 +432,14 @@ def _metadata_from_filename(path: Path) -> dict[str, str]:
     bids = re.search(r"(?:^|_)sub-([^_]+).*?(?:^|_)ses-([^_]+).*?(?:^|_)site-([^_]+)", stem)
     if bids:
         metadata["subject_id"] = bids.group(1)
-        metadata["session_id"] = bids.group(2)
+        metadata["session_id"] = normalize_session_id(bids.group(2))
         metadata["site"] = _canonical_site(bids.group(3))
         return metadata
     strambo = re.match(r"(STRAMBO_\d+)_([A-Za-z]{2})_Y?(\d+)", stem)
     if strambo:
         metadata["subject_id"] = strambo.group(1)
         metadata["site"] = _canonical_site(strambo.group(2))
-        metadata["session_id"] = f"Y{strambo.group(3)}" if "_Y" in stem else strambo.group(3)
+        metadata["session_id"] = normalize_session_id(f"Y{strambo.group(3)}" if "_Y" in stem else strambo.group(3))
     return metadata
 
 
@@ -394,6 +465,9 @@ def _role_from_filename(path: Path) -> str | None:
 
 def _canonical_site(site: str) -> str:
     normalized = str(site or "").strip().lower()
+    shared = normalize_site(normalized)
+    if shared:
+        return shared
     aliases = {
         "rl": "radius_left",
         "rr": "radius_right",
