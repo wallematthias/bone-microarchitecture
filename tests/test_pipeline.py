@@ -40,6 +40,7 @@ def test_compute_microarchitecture_returns_measurements_and_maps(tmp_path):
     assert result.measurements["Tb.TV"] == pytest.approx(0.125)
     assert result.measurements["Tb.BV/TV"] == pytest.approx(27 / 125)
     assert result.measurements["Tb.BMD"] == pytest.approx(((27 * 300.0) + (98 * 800.0)) / 125.0)
+    assert result.measurements["Tt.BMD"] == pytest.approx(((27 * 300.0) + (98 * 800.0) + (218 * 900.0)) / 343.0)
     assert result.measurements["Ct.BMD"] == pytest.approx(900.0)
     assert result.measurements["Ct.Po"] == pytest.approx(0.0)
     assert result.maps["Tb.Th"].shape == trab.shape
@@ -47,11 +48,12 @@ def test_compute_microarchitecture_returns_measurements_and_maps(tmp_path):
     assert result.maps["Ct.Th"].shape == trab.shape
     assert result.maps["Tb.BMD"].shape == trab.shape
     assert result.maps["Ct.BMD"].shape == trab.shape
+    assert result.maps["Tt.BMD"].shape == trab.shape
 
     rows = measurement_rows(result.measurements, result.maps)
     row_by_parameter = {row["Parameter"]: row for row in rows}
-    assert rows[0]["Parameter"] == "Tb.BMD"
-    assert rows[1]["Parameter"] == "Tb.BV/TV"
+    assert rows[0]["Parameter"] == "Tt.BMD"
+    assert rows[1]["Parameter"] == "Tb.BMD"
     assert row_by_parameter["Tb.BV/TV"]["Units"] == "fraction"
     assert row_by_parameter["Tb.Th"]["Mean"] == pytest.approx(result.measurements["Tb.Th"])
     assert row_by_parameter["Tb.Th"]["Median"] != ""
@@ -70,9 +72,31 @@ def test_compute_microarchitecture_returns_measurements_and_maps(tmp_path):
     write_measurement_csv(csv_path, result.measurements, result.maps)
     with csv_path.open(newline="", encoding="utf-8") as handle:
         exported = list(csv.DictReader(handle))
-    assert exported[0]["Parameter"] == "Tb.BMD"
-    assert exported[1]["Parameter"] == "Tb.BV/TV"
-    assert "P95" in exported[1]
+    assert exported[0]["Parameter"] == "Tt.BMD"
+    assert exported[1]["Parameter"] == "Tb.BMD"
+    assert "P95" in exported[2]
+
+
+def test_total_bmd_uses_the_full_periosteal_roi():
+    peri = np.zeros((3, 3, 3), dtype=bool)
+    peri[1:, 1:, 1:] = True
+    trab = np.zeros_like(peri)
+    trab[1, 1, 1] = True
+    bone = trab.copy()
+    grayscale = np.zeros(peri.shape, dtype=np.float32)
+    grayscale[peri] = 200.0
+    grayscale[trab] = 600.0
+
+    result = compute_microarchitecture(
+        bone_mask=bone,
+        periosteal_mask=peri,
+        trabecular_mask=trab,
+        grayscale=grayscale,
+        spacing=(1.0, 1.0, 1.0),
+        thickness_method="edt",
+    )
+
+    assert result.measurements["Tt.BMD"] == pytest.approx(250.0)
 
 
 def test_reported_measurements_have_parameter_definitions():

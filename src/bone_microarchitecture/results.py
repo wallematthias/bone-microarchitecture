@@ -8,6 +8,7 @@ import numpy as np
 
 
 MEASUREMENT_ORDER = (
+    "Tt.BMD",
     "Tb.BMD",
     "Tb.BV/TV",
     "Tb.Th",
@@ -55,11 +56,13 @@ _DISTRIBUTION_STAT_KEYS = {
     "Ct.Th": ("Ct.Th SD", "Ct.Th Min", "Ct.Th Max"),
     "Ct.Po.Dm": ("Ct.Po.Dm SD", "Ct.Po.Dm Min", "Ct.Po.Dm Max"),
     "Tb.BMD": ("Tb.BMD SD",),
+    "Tt.BMD": ("Tt.BMD SD",),
     "Ct.BMD": ("Ct.BMD SD",),
 }
 _SECONDARY_MEASUREMENTS = {name for names in _DISTRIBUTION_STAT_KEYS.values() for name in names}
 
 PARAMETER_DEFINITIONS = {
+    "Tt.BMD": "Mean grayscale/BMD value inside the full/periosteal compartment.",
     "Tb.BMD": "Mean grayscale/BMD value inside the trabecular compartment.",
     "Tb.BV/TV": "Trabecular bone volume divided by trabecular total volume, reported as a fraction.",
     "Tb.Th": "Mean maximal-sphere local thickness of trabecular bone.",

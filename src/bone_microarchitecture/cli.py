@@ -14,6 +14,7 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("dataset_root")
     batch.add_argument("--spacing", nargs=3, type=float, help="array-axis voxel spacing for .npy inputs")
     batch.add_argument("--no-common-region", action="store_true")
+    batch.add_argument("--require-common-region", action="store_true")
     batch.add_argument("--force", action="store_true", help="recompute even when compatible outputs exist")
     batch.add_argument("--subject", default="", help="measure only this subject id")
     batch.add_argument("--site", default="", help="measure only this site")
@@ -26,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
             args.dataset_root,
             spacing=tuple(args.spacing) if args.spacing is not None else None,
             use_common_region=not args.no_common_region,
+            require_common_region=args.require_common_region,
             force=args.force,
             subject_id=args.subject,
             site=args.site,

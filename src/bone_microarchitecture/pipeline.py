@@ -183,6 +183,10 @@ def compute_microarchitecture(
         maps["Ct.Po.Dm"] = pore_map
 
     if image is not None:
+        tt_mean, tt_sd = masked_mean_sd(image, peri)
+        metrics["Tt.BMD"] = tt_mean
+        metrics["Tt.BMD SD"] = tt_sd
+        maps["Tt.BMD"] = np.where(peri, image, 0).astype(np.float32)
         tb_mean, tb_sd = masked_mean_sd(image, trab_region)
         metrics["Tb.BMD"] = tb_mean
         metrics["Tb.BMD SD"] = tb_sd

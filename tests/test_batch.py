@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 from dataclasses import replace
 import json
+import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -125,7 +127,7 @@ def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurem
     assert float(rows["Tb.TV"]["Mean"]) == 8.0
     assert float(rows["Tb.BMD"]["Mean"]) == 100.0
     assert records[0].role == "measurements_table"
-    assert "/measurements/" in str(csv_path)
+    assert "/xct/registered_measurements/" in str(csv_path)
     manifest = read_manifest(manifest_path)
     map_records = [record for record in manifest.records if record.role != "measurements_table"]
     assert {record.role for record in map_records} == {
@@ -134,7 +136,8 @@ def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurem
         "trabecular_spacing_map",
         "trabecular_number_map",
     }
-    assert all(record.path.is_file() and "/maps/" in str(record.path) for record in map_records)
+    assert all(record.path.is_file() and "/xct/maps/" in str(record.path) for record in map_records)
+    assert not any("/xct/registered/maps/" in str(record.path) for record in manifest.records)
 
 
 def test_batch_loads_virtual_aim_source_image_view(monkeypatch, tmp_path):
@@ -234,6 +237,7 @@ def test_cli_module_execution_runs_batch(tmp_path):
             "cpu",
         ],
         check=True,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
     )
 
     assert (tmp_path / "derivatives" / "Microarchitecture" / "manifest.json").exists()
@@ -278,7 +282,357 @@ def test_batch_filters_accept_site_alias_from_slicer_ui(tmp_path):
     cases = batch._filter_cases(batch._discover_cases(tmp_path), subject_id="STRAMBO_0001", site="radius_left", session_id="00")
 
     assert len(cases) == 1
-    assert cases[0]["bone_segmentation"].site == "radius_left"
+    assert cases[0]["bone_segmentation"].site == "radiusleft"
+
+
+def test_batch_discovers_mids_style_raw_and_prefers_imported_contours(tmp_path):
+    sitk = pytest.importorskip("SimpleITK")
+    from bone_microarchitecture import batch
+
+    root = tmp_path / "dataset"
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    raw = root / "sub-001" / "ses-001" / "xct" / "sub-001_ses-001_voi-radiusleft_xct.nii.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(raw))
+    for family in ("BoneContours", "ImportedContours"):
+        for role in ("seg", "full", "trab"):
+            output = (
+                root
+                / "derivatives"
+                / family
+                / "sub-001"
+                / "ses-001"
+                / "xct"
+                / f"sub-001_ses-001_voi-radiusleft_desc-{role}_mask.nii.gz"
+            )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            sitk.WriteImage(sitk.GetImageFromArray(mask), str(output))
+
+    cases = batch._discover_cases(root)
+
+    assert len(cases) == 1
+    assert cases[0]["transformed_image"].path == raw
+    assert "/derivatives/ImportedContours/" in str(cases[0]["bone_segmentation"].path)
+    assert "/derivatives/ImportedContours/" in str(cases[0]["periosteal_mask"].path)
+    assert "/derivatives/ImportedContours/" in str(cases[0]["trabecular_mask"].path)
+
+
+def test_batch_filter_accepts_compact_voi_token_for_normalized_site(tmp_path):
+    sitk = pytest.importorskip("SimpleITK")
+    from bone_microarchitecture import batch
+
+    root = tmp_path / "dataset"
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    raw = root / "sub-001" / "ses-003" / "xct" / "sub-001_ses-003_voi-radiusleft_xct.nii.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(raw))
+    for role in ("seg", "full", "trab"):
+        output = (
+            root
+            / "derivatives"
+            / "BoneContours"
+            / "sub-001"
+            / "ses-003"
+            / "xct"
+            / f"sub-001_ses-003_voi-radiusleft_desc-{role}_mask.nii.gz"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(sitk.GetImageFromArray(mask), str(output))
+
+    cases = batch._filter_cases(batch._discover_cases(root), subject_id="001", site="radiusleft", session_id="003")
+
+    assert len(cases) == 1
+    assert cases[0]["transformed_image"].path == raw
+
+
+def test_batch_groups_compact_and_underscored_sites_into_one_case(tmp_path):
+    from bone_microarchitecture import batch
+
+    image = tmp_path / "image.npy"
+    bone = tmp_path / "bone.npy"
+    peri = tmp_path / "peri.npy"
+    trab = tmp_path / "trab.npy"
+    for path in (image, bone, peri, trab):
+        np.save(path, np.ones((3, 3, 3), dtype=np.uint8))
+    write_manifest(
+        DerivativeManifest.create(
+            "Segmentation",
+            tmp_path,
+            {"name": "test", "version": "1"},
+            records=(
+                replace(_record(tmp_path, "transformed_image", image, derivative="Registration"), site="radius_left", session_id="003"),
+                replace(_record(tmp_path, "bone_segmentation", bone), site="radiusleft", session_id="003"),
+                replace(_record(tmp_path, "periosteal_mask", peri), site="radiusleft", session_id="003"),
+                replace(_record(tmp_path, "trabecular_mask", trab), site="radiusleft", session_id="003"),
+            ),
+        ),
+        tmp_path / "derivatives/Segmentation/manifest.json",
+    )
+
+    cases = batch._filter_cases(batch._discover_cases(tmp_path), subject_id="SAMPLE001", site="radiusleft", session_id="003")
+
+    assert len(cases) == 1
+    assert sorted(cases[0]) == ["bone_segmentation", "periosteal_mask", "trabecular_mask", "transformed_image"]
+
+
+def test_batch_common_region_mode_requires_native_common_region(tmp_path):
+    sitk = pytest.importorskip("SimpleITK")
+    from bone_microarchitecture import batch
+
+    root = tmp_path / "dataset"
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    raw = root / "sub-001" / "ses-003" / "xct" / "sub-001_ses-003_voi-radiusleft_xct.nii.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(raw))
+    for role in ("seg", "full", "trab"):
+        output = (
+            root
+            / "derivatives"
+            / "BoneContours"
+            / "sub-001"
+            / "ses-003"
+            / "xct"
+            / f"sub-001_ses-003_voi-radiusleft_desc-{role}_mask.nii.gz"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(sitk.GetImageFromArray(mask), str(output))
+
+    with pytest.raises(ValueError, match=r"scan_region_native_common"):
+        batch.run_microarchitecture_batch(
+            root,
+            use_common_region=True,
+            require_common_region=True,
+            subject_id="001",
+            site="radiusleft",
+            session_id="003",
+        )
+
+
+def test_batch_common_region_unstacked_matches_unstacked_case(tmp_path):
+    from bone_microarchitecture import batch
+
+    sitk = pytest.importorskip("SimpleITK")
+    root = tmp_path / "dataset"
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    raw = root / "sub-001" / "ses-003" / "xct" / "sub-001_ses-003_voi-radiusleft_xct.nii.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(raw))
+    for role in ("seg", "full", "trab"):
+        output = (
+            root
+            / "derivatives"
+            / "BoneContours"
+            / "sub-001"
+            / "ses-003"
+            / "xct"
+            / f"sub-001_ses-003_voi-radiusleft_desc-{role}_mask.nii.gz"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(sitk.GetImageFromArray(mask), str(output))
+    common_path = (
+        root
+        / "derivatives"
+        / "CommonRegion"
+        / "sub-001"
+        / "ses-003"
+        / "xct"
+        / "masks"
+        / "sub-001_ses-003_voi-radiusleft_mask-scan-region_native_common.nii.gz"
+    )
+    common_path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(mask), str(common_path))
+    write_manifest(
+        DerivativeManifest.create(
+            "CommonRegion",
+            root,
+            {"name": "test", "version": "1"},
+            records=(
+                DerivativeRecord(
+                    "CommonRegion",
+                    "scan_region_native_common",
+                    "001",
+                    "radiusleft",
+                    "003",
+                    None,
+                    "native",
+                    common_path,
+                    "generated",
+                    content_type="mask",
+                ),
+            ),
+        ),
+        root / "derivatives" / "CommonRegion" / "manifest.json",
+    )
+
+    records = batch.run_microarchitecture_batch(
+        root,
+        use_common_region=True,
+        require_common_region=True,
+        subject_id="001",
+        site="radiusleft",
+        session_id="003",
+        thickness_method="edt",
+        thickness_backend="cpu",
+    )
+
+    assert records
+    assert records[0].metadata["use_common_region"] is True
+
+
+def test_batch_common_region_mode_rejects_stack_one_common_region_for_unstacked_case(tmp_path):
+    from bone_microarchitecture import batch
+
+    sitk = pytest.importorskip("SimpleITK")
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    raw = tmp_path / "sub-001" / "ses-003" / "xct" / "sub-001_ses-003_voi-radiusleft_xct.nii.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(raw))
+    for role in ("seg", "full", "trab"):
+        output = (
+            tmp_path
+            / "derivatives"
+            / "BoneContours"
+            / "sub-001"
+            / "ses-003"
+            / "xct"
+            / f"sub-001_ses-003_voi-radiusleft_desc-{role}_mask.nii.gz"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(sitk.GetImageFromArray(mask), str(output))
+    common_path = (
+        tmp_path
+        / "derivatives"
+        / "CommonRegion"
+        / "sub-001"
+        / "ses-003"
+        / "xct"
+        / "masks"
+        / "sub-001_ses-003_voi-radiusleft_stack-01_mask-scan-region_native_common.nii.gz"
+    )
+    common_path.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(mask), str(common_path))
+    write_manifest(
+        DerivativeManifest.create(
+            "CommonRegion",
+            tmp_path,
+            {"name": "test", "version": "1"},
+            records=(
+                DerivativeRecord(
+                    "CommonRegion",
+                    "scan_region_native_common",
+                    "001",
+                    "radiusleft",
+                    "003",
+                    1,
+                    "native",
+                    common_path,
+                    "generated",
+                    content_type="mask",
+                ),
+            ),
+        ),
+        tmp_path / "derivatives" / "CommonRegion" / "manifest.json",
+    )
+
+    with pytest.raises(ValueError, match=r"scan_region_native_common"):
+        batch.run_microarchitecture_batch(
+            tmp_path,
+            use_common_region=True,
+            require_common_region=True,
+            subject_id="001",
+            site="radiusleft",
+            session_id="003",
+            thickness_method="edt",
+            thickness_backend="cpu",
+        )
+
+
+def test_batch_refuses_incomplete_rows_before_starting_measurements(tmp_path, monkeypatch):
+    from bone_microarchitecture import batch
+
+    sitk = pytest.importorskip("SimpleITK")
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    image_path = tmp_path / "sub-001" / "ses-001" / "xct" / "sub-001_ses-001_voi-radiusleft_xct.nii.gz"
+    image_path.parent.mkdir(parents=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(image_path))
+    for role in ("seg", "full"):
+        path = (
+            tmp_path
+            / "derivatives"
+            / "ImportedContours"
+            / "sub-001"
+            / "ses-001"
+            / "xct"
+            / f"sub-001_ses-001_voi-radiusleft_desc-{role}_mask.npy"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, mask)
+
+    monkeypatch.setattr(batch, "compute_microarchitecture", lambda **_kwargs: pytest.fail("must not run"))
+
+    with pytest.raises(ValueError, match=r"sub-001.*ses-001.*radiusleft.*trabecular_mask"):
+        batch.run_microarchitecture_batch(
+            tmp_path,
+            spacing=(1.0, 1.0, 1.0),
+            thickness_method="edt",
+            thickness_backend="cpu",
+        )
+
+
+def test_batch_does_not_treat_existing_microarchitecture_maps_as_incomplete_inputs(tmp_path):
+    from bone_microarchitecture.batch import run_microarchitecture_batch
+
+    _write_case(tmp_path)
+    map_path = (
+        tmp_path
+        / "derivatives"
+        / "Microarchitecture"
+        / "sub-002"
+        / "ses-001"
+        / "xct"
+        / "maps"
+        / "sub-002_ses-001_voi-radiusleft_map-tb-th.npy"
+    )
+    map_path.parent.mkdir(parents=True)
+    np.save(map_path, np.ones((3, 3, 3), dtype=np.float32))
+    write_manifest(
+        DerivativeManifest.create(
+            "Microarchitecture",
+            tmp_path,
+            {"name": "test", "version": "1"},
+            records=(
+                DerivativeRecord(
+                    derivative="Microarchitecture",
+                    role="trabecular_thickness_map",
+                    subject_id="002",
+                    site="radius_left",
+                    session_id="001",
+                    stack_index=None,
+                    space="native",
+                    path=map_path,
+                    source="generated",
+                    content_type="image",
+                ),
+            ),
+        ),
+        tmp_path / "derivatives" / "Microarchitecture" / "manifest.json",
+    )
+
+    records = run_microarchitecture_batch(
+        tmp_path,
+        spacing=(1.0, 1.0, 1.0),
+        thickness_method="edt",
+        thickness_backend="cpu",
+    )
+
+    assert len(records) == 1
+    assert records[0].subject_id == "SAMPLE001"
 
 
 def test_run_batch_treats_selected_derivatives_folder_as_dataset_root(tmp_path):
@@ -544,8 +898,8 @@ def test_batch_discovers_root_images_with_derivative_segmentation_masks(tmp_path
     assert cases[0]["cortical_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-cort.npy"
 
 
-def test_batch_discovery_ignores_timelapsed_outputs_as_individual_inputs(tmp_path):
-    """Timelapsed fused outputs should not duplicate native microarchitecture cases."""
+def test_batch_discovery_ignores_timelapse_outputs_as_individual_inputs(tmp_path):
+    """Timelapse fused outputs should not duplicate native microarchitecture cases."""
     from bone_microarchitecture import batch
 
     image = np.full((4, 4, 4), 100.0, dtype=np.float32)
@@ -553,7 +907,7 @@ def test_batch_discovery_ignores_timelapsed_outputs_as_individual_inputs(tmp_pat
     np.save(tmp_path / "STRAMBO_0001_RL_Y00_image.npy", image)
     for role in ("seg", "full", "trab"):
         np.save(tmp_path / f"STRAMBO_0001_RL_Y00_mask-{role}.npy", mask)
-    fused_dir = tmp_path / "derivatives" / "TimelapsedHRpQCT" / "sub-STRAMBO_0001" / "site-radius_left" / "ses-00" / "stacks"
+    fused_dir = tmp_path / "derivatives" / "Timelapse" / "sub-STRAMBO_0001" / "ses-00" / "xct" / "images"
     fused_dir.mkdir(parents=True)
     fused_image = fused_dir / "sub-STRAMBO_0001_site-radius_left_ses-00_image_fused.npy"
     fused_seg = fused_dir / "sub-STRAMBO_0001_site-radius_left_ses-00_stack-01_seg.npy"
@@ -561,12 +915,12 @@ def test_batch_discovery_ignores_timelapsed_outputs_as_individual_inputs(tmp_pat
     np.save(fused_seg, mask)
     write_manifest(
         DerivativeManifest.create(
-            "Timelapsed",
+            "Timelapse",
             tmp_path,
             {"name": "timelapsed", "version": "test"},
             records=(
                 DerivativeRecord(
-                    "Timelapsed",
+                    "Timelapse",
                     "transformed_image",
                     "STRAMBO_0001",
                     "radius_left",
@@ -578,7 +932,7 @@ def test_batch_discovery_ignores_timelapsed_outputs_as_individual_inputs(tmp_pat
                     content_type="image",
                 ),
                 DerivativeRecord(
-                    "Timelapsed",
+                    "Timelapse",
                     "bone_segmentation",
                     "STRAMBO_0001",
                     "radius_left",
@@ -696,7 +1050,7 @@ def test_batch_discovers_sidecar_described_non_aim_inputs(tmp_path):
     assert case["trabecular_mask"].path.name == "inner-roi.nii.gz"
     assert case["bone_segmentation"].subject_id == "S01"
     assert case["bone_segmentation"].session_id == "baseline"
-    assert case["bone_segmentation"].site == "tibia_right"
+    assert case["bone_segmentation"].site == "tibiaright"
 
 
 def test_batch_discovers_bare_scanco_aim_scan_with_aim_masks(tmp_path):
@@ -711,7 +1065,7 @@ def test_batch_discovers_bare_scanco_aim_scan_with_aim_masks(tmp_path):
 
     assert len(cases) == 1
     assert cases[0]["transformed_image"].path.name == "STRAMBO_0001_RL_Y00.AIM"
-    assert cases[0]["transformed_image"].site == "radius_left"
+    assert cases[0]["transformed_image"].site == "radiusleft"
     assert cases[0]["transformed_image"].session_id == "00"
     assert cases[0]["bone_segmentation"].path.name == "STRAMBO_0001_RL_Y00_mask-seg.AIM"
     assert cases[0]["periosteal_mask"].path.name == "STRAMBO_0001_RL_Y00_mask-full.AIM"
@@ -733,7 +1087,7 @@ def test_batch_discovery_preserves_left_and_right_site_identity(tmp_path):
 
     cases = batch._discover_cases(tmp_path)
 
-    assert sorted(case["bone_segmentation"].site for case in cases) == ["radius_left", "radius_right"]
+    assert sorted(case["bone_segmentation"].site for case in cases) == ["radiusleft", "radiusright"]
 
 
 def test_batch_reuses_compatible_records_and_recomputes_when_settings_or_inputs_change(tmp_path, monkeypatch):
@@ -800,6 +1154,84 @@ def test_batch_reuses_compatible_records_and_recomputes_when_settings_or_inputs_
     assert preserved in records
 
 
+def test_registered_and_native_measurements_share_native_maps(tmp_path, monkeypatch):
+    """Common-region measurements should reuse native maps instead of recomputing them."""
+    import bone_microarchitecture.batch as batch
+
+    image = np.full((4, 4, 4), 100.0, dtype=np.float32)
+    mask = np.ones((4, 4, 4), dtype=np.uint8)
+    common_region = np.zeros((4, 4, 4), dtype=np.uint8)
+    common_region[:2, :, :] = 1
+    paths = {
+        "image": "inputs/image.npy",
+        "bone": "inputs/bone.npy",
+        "peri": "inputs/peri.npy",
+        "trab": "inputs/trab.npy",
+        "common": "inputs/common.npy",
+    }
+    for name, array in {
+        "image": image,
+        "bone": mask,
+        "peri": mask,
+        "trab": mask,
+        "common": common_region,
+    }.items():
+        path = tmp_path / paths[name]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, array)
+    write_manifest(
+        DerivativeManifest.create(
+            "Segmentation",
+            tmp_path,
+            {"name": "test", "version": "1"},
+            records=(
+                _record(tmp_path, "transformed_image", paths["image"], derivative="Registration"),
+                _record(tmp_path, "bone_segmentation", paths["bone"]),
+                _record(tmp_path, "periosteal_mask", paths["peri"]),
+                _record(tmp_path, "trabecular_mask", paths["trab"]),
+                _record(tmp_path, "scan_region_native_common", paths["common"], derivative="CommonRegion"),
+            ),
+        ),
+        tmp_path / "derivatives/Segmentation/manifest.json",
+    )
+
+    batch.run_microarchitecture_batch(
+        tmp_path,
+        spacing=(1.0, 1.0, 1.0),
+        thickness_method="edt",
+        thickness_backend="cpu",
+        require_common_region=True,
+    )
+    registered_records = read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
+    assert any("/xct/registered_measurements/" in str(record.path) for record in registered_records)
+    assert any("/xct/maps/" in str(record.path) for record in registered_records)
+    assert not any("/xct/registered/maps/" in str(record.path) for record in registered_records)
+
+    def should_not_compute(**_kwargs):
+        raise AssertionError("native maps should be reused")
+
+    monkeypatch.setattr(batch, "compute_microarchitecture", should_not_compute)
+    progress_events = []
+    batch.run_microarchitecture_batch(
+        tmp_path,
+        spacing=(1.0, 1.0, 1.0),
+        thickness_method="edt",
+        thickness_backend="cpu",
+        use_common_region=False,
+        progress=progress_events.append,
+    )
+    records = read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
+    assert any("/xct/measurements/" in str(record.path) for record in records)
+    assert sum(1 for record in records if record.role == "trabecular_thickness_map") == 1
+    assert any(
+        event.step == "maps"
+        and event.status == "reused"
+        and event.message == "Reused native microarchitecture maps"
+        and str(event.path).endswith("/xct/maps")
+        for event in progress_events
+    )
+
+
 def test_grayscale_batch_persists_bmd_maps_with_deterministic_generic_role(tmp_path):
     """Every BMD map returned by the core pipeline must be discoverable in the manifest."""
     from bone_microarchitecture.batch import run_microarchitecture_batch
@@ -812,7 +1244,42 @@ def test_grayscale_batch_persists_bmd_maps_with_deterministic_generic_role(tmp_p
 
     bmd_records = [
         record for record in read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
-        if record.role == "material_map" and record.metadata.get("map_name") in {"Tb.BMD", "Ct.BMD"}
+        if record.role == "material_map" and record.metadata.get("map_name") in {"Tt.BMD", "Tb.BMD", "Ct.BMD"}
     ]
-    assert {record.metadata["map_name"] for record in bmd_records} == {"Tb.BMD", "Ct.BMD"}
+    assert {record.metadata["map_name"] for record in bmd_records} == {"Tt.BMD", "Tb.BMD", "Ct.BMD"}
     assert all(record.path.is_file() for record in bmd_records)
+
+
+def test_batch_recomputes_compatible_outputs_when_ttbmd_is_missing_from_old_csv(tmp_path, monkeypatch):
+    """Old reused measurements without Tt.BMD should not hide current required rows."""
+    from bone_microarchitecture import batch
+
+    _write_case(tmp_path)
+    calls = []
+    original_compute = batch.compute_microarchitecture
+
+    def fake_compute(**kwargs):
+        calls.append(kwargs)
+        return original_compute(**kwargs)
+
+    monkeypatch.setattr(batch, "compute_microarchitecture", fake_compute)
+    records = batch.run_microarchitecture_batch(tmp_path, spacing=(1.0, 1.0, 1.0), thickness_method="edt", thickness_backend="cpu")
+    assert len(calls) == 1
+
+    csv_path = records[0].path
+    rows = []
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if row["Parameter"] != "Tt.BMD":
+                rows.append(row)
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    calls.clear()
+    batch.run_microarchitecture_batch(tmp_path, spacing=(1.0, 1.0, 1.0), thickness_method="edt", thickness_backend="cpu")
+
+    assert len(calls) == 0
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        assert "Tt.BMD" in {row["Parameter"] for row in csv.DictReader(handle)}

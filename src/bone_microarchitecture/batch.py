@@ -22,10 +22,12 @@ from bone_imaging_derivatives import (
     read_manifest,
     write_manifest,
 )
-from bone_imaging_derivatives.layout import manifest_path, record_output_path
+from bone_imaging_derivatives.layout import manifest_path, record_output_path, voi_token
 
 from .pipeline import compute_microarchitecture
+from .metrics import compartment_metrics, masked_mean_sd
 from .results import write_measurement_csv
+from .thickness import summary
 
 
 _REQUIRED_ROLES = ("bone_segmentation", "periosteal_mask", "trabecular_mask")
@@ -43,6 +45,7 @@ _MAP_ROLES = {
     "Tb.N": "trabecular_number_map",
     "Ct.Th": "cortical_thickness_map",
     "Ct.Po.Dm": "cortical_porosity_map",
+    "Tt.BMD": "material_map",
     "Tb.BMD": "material_map",
     "Ct.BMD": "material_map",
 }
@@ -70,6 +73,7 @@ def run_microarchitecture_batch(
     spacing: tuple[float, float, float] | None = None,
     use_common_region: bool = True,
     force: bool = False,
+    require_common_region: bool = False,
     thickness_method: str = "hildebrand",
     thickness_backend: str = "auto",
     subject_id: str = "",
@@ -86,8 +90,15 @@ def run_microarchitecture_batch(
     yet available, primarily for lightweight command-line workflows.
     """
     root = _dataset_root(Path(dataset_root).resolve())
-    cases = _discover_cases(root)
-    cases = _filter_cases(cases, subject_id=subject_id, site=site, session_id=session_id)
+    cases = _filter_cases(
+        _discover_case_rows(root),
+        subject_id=subject_id,
+        site=site,
+        session_id=session_id,
+    )
+    incomplete = [case for case in cases if _missing_required_roles(case, require_common_region=require_common_region)]
+    if incomplete:
+        raise ValueError(_incomplete_case_message(incomplete, require_common_region=require_common_region))
     if not cases:
         raise ValueError("No complete microarchitecture input case was found")
 
@@ -106,9 +117,17 @@ def run_microarchitecture_batch(
         if use_common_region and "scan_region_native_common" in case:
             input_roles.append("scan_region_native_common")
         input_ids = tuple(case[role].record_id for role in input_roles)
+        native_input_roles = ["transformed_image", "bone_segmentation", "periosteal_mask", "trabecular_mask"]
+        if "cortical_mask" in case:
+            native_input_roles.append("cortical_mask")
+        native_input_ids = tuple(case[role].record_id for role in native_input_roles)
         settings_hash = _compatibility_hash(input_ids, case_spacing, use_common_region, thickness_method, thickness_backend)
+        native_map_hash = _compatibility_hash(native_input_ids, case_spacing, False, thickness_method, thickness_backend)
         case_key = _output_case_key(case["bone_segmentation"])
-        reused = None if force else _find_compatible_measurement_record(
+        native_map_records = None if force else _find_compatible_native_map_records(
+            existing_records, case_key, native_input_ids, native_map_hash, case
+        )
+        reused = None if force or native_map_records is None else _find_compatible_measurement_record(
             existing_records, case_key, input_ids, settings_hash, case
         )
         if reused is not None:
@@ -116,34 +135,69 @@ def run_microarchitecture_batch(
             _emit(progress, subject_id, site, session_id, "measure", "reused", "Reused compatible measurements", reused.path)
             continue
 
-        _emit(progress, subject_id, site, session_id, "measure", "started", "Computing microarchitecture")
         masks = {role: _load_record_volume(record).array for role, record in case.items() if role != "transformed_image"}
         common = masks.pop("scan_region_native_common", None) if use_common_region else None
-        if common is not None:
-            common = np.asarray(common) > 0
-            masks = {role: (np.asarray(mask) > 0) & common for role, mask in masks.items()}
+        common_mask = np.asarray(common) > 0 if common is not None else None
 
-        result = compute_microarchitecture(
-            grayscale=image.array,
-            bone_mask=masks["bone_segmentation"],
-            periosteal_mask=masks["periosteal_mask"],
-            trabecular_mask=masks["trabecular_mask"],
-            cortical_mask=masks.get("cortical_mask"),
-            spacing=case_spacing,
-            thickness_method=thickness_method,
-            thickness_backend=thickness_backend,
+        native_maps = None if native_map_records is None else _load_native_maps_from_records(native_map_records)
+        if native_maps is None:
+            native_map_records = None
+            _emit(progress, subject_id, site, session_id, "measure", "started", "Computing microarchitecture")
+            result = compute_microarchitecture(
+                grayscale=image.array,
+                bone_mask=masks["bone_segmentation"],
+                periosteal_mask=masks["periosteal_mask"],
+                trabecular_mask=masks["trabecular_mask"],
+                cortical_mask=masks.get("cortical_mask"),
+                spacing=case_spacing,
+                thickness_method=thickness_method,
+                thickness_backend=thickness_backend,
+            )
+            native_measurements = result.measurements
+            native_maps = result.maps
+            resolved_backend = result.metadata["thickness_backend"]
+        else:
+            map_dir = next(iter(native_map_records.values())).path.parent if native_map_records else None
+            _emit(
+                progress,
+                subject_id,
+                site,
+                session_id,
+                "maps",
+                "reused",
+                "Reused native microarchitecture maps",
+                map_dir,
+            )
+            _emit(progress, subject_id, site, session_id, "measure", "started", "Summarizing existing microarchitecture maps")
+            native_measurements = _summarize_measurements(
+                image.array,
+                masks,
+                native_maps,
+                case_spacing,
+            )
+            resolved_backend = thickness_backend
+        measurement_masks = masks
+        if common_mask is not None:
+            measurement_masks = {role: (np.asarray(mask) > 0) & common_mask for role, mask in masks.items()}
+        measurements = native_measurements if common_mask is None else _summarize_measurements(
+            image.array,
+            measurement_masks,
+            native_maps,
+            case_spacing,
         )
+        measurement_maps = _masked_maps_for_measurements(native_maps, measurement_masks)
         session_part = f"ses-{session_id}" if session_id else "ses-unknown"
-        filename = f"sub-{subject_id}_{session_part}_site-{site}_measurements.csv"
+        measurement_dir = "registered_measurements" if common_mask is not None else "measurements"
+        filename = f"sub-{subject_id}_{session_part}_voi-{voi_token(site)}_measurements.csv"
         output_path = record_output_path(
-            root, "Microarchitecture", subject_id, site, "native_space", session_part, "measurements", filename
+            root, "Microarchitecture", subject_id, site, session_part, measurement_dir, filename
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_measurement_csv(output_path, result.measurements, result.maps)
+        write_measurement_csv(output_path, measurements, measurement_maps)
         record_metadata = {
-            "use_common_region": common is not None,
+            "use_common_region": common_mask is not None,
             "thickness_method": thickness_method,
-            "thickness_backend": result.metadata["thickness_backend"],
+            "thickness_backend": resolved_backend,
             "settings_hash": settings_hash,
         }
         measurement_record = DerivativeRecord(
@@ -163,42 +217,49 @@ def run_microarchitecture_batch(
         )
         output_records.append(measurement_record)
         measurement_records.append(measurement_record)
-        for map_name, map_array in result.maps.items():
-            role = _MAP_ROLES.get(map_name, "material_map")
-            extension = ".nii.gz" if image.sitk_image is not None else ".npy"
-            map_filename = f"sub-{subject_id}_{session_part}_site-{site}_map-{map_name.lower().replace('.', '-')}{extension}"
-            map_path = record_output_path(
-                root, "Microarchitecture", subject_id, site, "native_space", session_part, "maps", map_filename
-            )
-            _write_map(map_path, map_array, image)
-            output_records.append(
-                DerivativeRecord(
-                    derivative="Microarchitecture",
-                    role=role,
-                    subject_id=subject_id,
-                    site=site,
-                    session_id=session_id,
-                    stack_index=stack_index,
-                    space="native",
-                    path=map_path,
-                    source="generated",
-                    inputs=input_ids,
-                    metadata={**record_metadata, "map_name": map_name},
-                    content_type="image",
-                    settings_hash=settings_hash,
+        if native_map_records is None:
+            for map_name, map_array in native_maps.items():
+                role = _MAP_ROLES.get(map_name, "material_map")
+                extension = ".nii.gz" if image.sitk_image is not None else ".npy"
+                map_filename = f"sub-{subject_id}_{session_part}_voi-{voi_token(site)}_map-{map_name.lower().replace('.', '-')}{extension}"
+                map_path = record_output_path(
+                    root, "Microarchitecture", subject_id, site, session_part, "maps", map_filename
                 )
-            )
+                _write_map(map_path, map_array, image)
+                output_records.append(
+                    DerivativeRecord(
+                        derivative="Microarchitecture",
+                        role=role,
+                        subject_id=subject_id,
+                        site=site,
+                        session_id=session_id,
+                        stack_index=stack_index,
+                        space="native",
+                        path=map_path,
+                        source="generated",
+                        inputs=native_input_ids,
+                        metadata={
+                            "use_common_region": False,
+                            "thickness_method": thickness_method,
+                            "thickness_backend": resolved_backend,
+                            "settings_hash": native_map_hash,
+                            "map_name": map_name,
+                        },
+                        content_type="image",
+                        settings_hash=native_map_hash,
+                    )
+                )
         _emit(progress, subject_id, site, session_id, "measure", "completed", "Wrote measurements", output_path)
 
     if output_records:
-        superseded = {(_output_case_key(record), _record_signature(record)) for record in output_records}
+        superseded = {(_output_case_key(record), _record_replacement_signature(record)) for record in output_records}
         merged_records = [
             record for record in existing_records
-            if (_output_case_key(record), _record_signature(record)) not in superseded
+            if (_output_case_key(record), _record_replacement_signature(record)) not in superseded
         ]
         merged_records.extend(output_records)
         manifest = DerivativeManifest.create(
-            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.2.2"},
+            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.2.3"},
             records=tuple(merged_records),
         )
         write_manifest(manifest, manifest_path(root, "Microarchitecture"))
@@ -213,7 +274,7 @@ def _filter_cases(cases, *, subject_id: str = "", site: str = "", session_id: st
         return list(cases)
     filtered = []
     for case in cases:
-        case_subject, case_site, case_session, _stack_index, _space = _case_key(case["bone_segmentation"])
+        case_subject, case_site, case_session, _stack_index, _space = _case_key_from_case(case)
         if subject_id and str(case_subject) != subject_id:
             continue
         if site and not _sites_match(case_site, site):
@@ -229,14 +290,25 @@ def _dataset_root(root: Path) -> Path:
 
 
 def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
+    return [case for case in _discover_case_rows(root) if not _missing_required_roles(case)]
+
+
+def _discover_case_rows(root: Path) -> list[dict[str, DerivativeRecord]]:
     records = [record for manifest in discover_manifests(root) for record in manifest.records]
     records.extend(_discover_shared_artifact_records(root))
     records.extend(_discover_structured_input_records(root))
-    records = list(_deduplicate_records(records))
+    records = list(_deduplicate_records(sorted(records, key=lambda record: _record_source_priority(root, record))))
     cases: list[dict[str, DerivativeRecord]] = []
-    for bone in (record for record in records if record.role == "bone_segmentation"):
-        key = _case_key(bone)
-        case = {"bone_segmentation": bone}
+    keys = {
+        _case_key(record)
+        for record in records
+        if record.role in {"bone_segmentation", "transformed_image", "source_image_view"}
+    }
+    for key in sorted(keys, key=lambda value: tuple("" if item is None else str(item) for item in value)):
+        case: dict[str, DerivativeRecord] = {}
+        bone = _matching_record(records, "bone_segmentation", key)
+        if bone is not None:
+            case["bone_segmentation"] = bone
         for role in ("periosteal_mask", "trabecular_mask", "cortical_mask", "scan_region_native_common"):
             match = _matching_record(records, role, key)
             if match is not None:
@@ -246,9 +318,51 @@ def _discover_cases(root: Path) -> list[dict[str, DerivativeRecord]]:
             image = _matching_image_record(records, key)
         if image is not None:
             case["transformed_image"] = image
-        if all(role in case for role in (*_REQUIRED_ROLES, "transformed_image")):
+        if case:
             cases.append(case)
     return cases or _fallback_case(root)
+
+
+def _record_source_priority(root: Path, record: DerivativeRecord) -> int:
+    try:
+        parts = [part.lower().replace("-", "") for part in record.path.resolve().relative_to(root).parts]
+    except ValueError:
+        parts = []
+    family = ""
+    if "derivatives" in parts:
+        index = parts.index("derivatives")
+        if index + 1 < len(parts):
+            family = parts[index + 1]
+    if not family:
+        family = record.derivative.lower().replace("-", "")
+    return {"importedcontours": 0, "bonecontours": 1}.get(family, 2)
+
+
+def _missing_required_roles(case: dict[str, DerivativeRecord], *, require_common_region: bool = False) -> tuple[str, ...]:
+    roles = [*_REQUIRED_ROLES, "transformed_image"]
+    if require_common_region:
+        roles.append("scan_region_native_common")
+    return tuple(role for role in roles if role not in case)
+
+
+def _case_key_from_case(case: dict[str, DerivativeRecord]) -> tuple[str, str, str | None, int | None, str]:
+    record = case.get("bone_segmentation") or case.get("transformed_image")
+    if record is None:
+        raise ValueError("Microarchitecture case has no identifiable input artifact")
+    return _case_key(record)
+
+
+def _incomplete_case_message(cases: list[dict[str, DerivativeRecord]], *, require_common_region: bool = False) -> str:
+    descriptions = []
+    for case in cases:
+        subject_id, site, session_id, stack_index, _space = _case_key_from_case(case)
+        identity = f"sub-{subject_id}, ses-{session_id or 'unknown'}, voi-{site}"
+        if stack_index is not None:
+            identity = f"{identity}, stack-{stack_index:02d}"
+        descriptions.append(
+            f"{identity}: missing {', '.join(_missing_required_roles(case, require_common_region=require_common_region))}"
+        )
+    return "Microarchitecture batch prerequisites are incomplete: " + "; ".join(descriptions)
 
 
 def _discover_shared_artifact_records(root: Path) -> list[DerivativeRecord]:
@@ -306,7 +420,16 @@ def _artifact_is_microarchitecture_input_source(root: Path, path: Path) -> bool:
     if index + 1 >= len(parts):
         return False
     family = parts[index + 1]
-    return family in {"segmentation", "registration", "calibration", "commonregion", "common_region"}
+    return family in {
+        "importedcontours",
+        "iplcontours",
+        "bonecontours",
+        "segmentation",
+        "registration",
+        "calibration",
+        "commonregion",
+        "common_region",
+    }
 
 
 def _deduplicate_records(records):
@@ -319,7 +442,6 @@ def _deduplicate_records(records):
             record.session_id,
             record.stack_index,
             record.space,
-            Path(record.path).resolve(),
         )
         if key in seen:
             continue
@@ -416,6 +538,8 @@ def _metadata_from_path_parts(root: Path, path: Path) -> tuple[str, str, str | N
             subject_id = part[4:]
         elif part.startswith("site-"):
             site = _canonical_site(part[5:])
+        elif part.startswith("voi-"):
+            site = _canonical_site(part[4:])
         elif part.startswith("ses-"):
             session_id = normalize_session_id(part[4:])
         elif part.startswith("stack-"):
@@ -429,7 +553,7 @@ def _metadata_from_path_parts(root: Path, path: Path) -> tuple[str, str, str | N
 def _metadata_from_filename(path: Path) -> dict[str, str]:
     stem = _volume_stem(path)
     metadata: dict[str, str] = {}
-    bids = re.search(r"(?:^|_)sub-([^_]+).*?(?:^|_)ses-([^_]+).*?(?:^|_)site-([^_]+)", stem)
+    bids = re.search(r"(?:^|_)sub-([^_]+).*?(?:^|_)ses-([^_]+).*?(?:^|_)(?:site|voi)-([^_]+)", stem)
     if bids:
         metadata["subject_id"] = bids.group(1)
         metadata["session_id"] = normalize_session_id(bids.group(2))
@@ -469,22 +593,17 @@ def _canonical_site(site: str) -> str:
     if shared:
         return shared
     aliases = {
-        "rl": "radius_left",
-        "rr": "radius_right",
-        "tl": "tibia_left",
-        "tr": "tibia_right",
+        "rl": "radiusleft",
+        "rr": "radiusright",
+        "tl": "tibialeft",
+        "tr": "tibiaright",
     }
     return aliases.get(normalized, normalized)
 
 
 def _filter_site(site: str) -> str:
     normalized = str(site or "").strip().lower()
-    return {
-        "rl": "radius_left",
-        "rr": "radius_right",
-        "tl": "tibia_left",
-        "tr": "tibia_right",
-    }.get(normalized, normalized)
+    return normalize_site(normalized) or normalized
 
 
 def _sites_match(case_site: str, requested_site: str) -> bool:
@@ -538,11 +657,30 @@ def _volume_name(path: Path) -> str:
 
 
 def _matching_record(records, role: str, key):
-    return next((record for record in records if record.role == role and _case_key(record) == key), None)
+    exact = next((record for record in records if record.role == role and _case_key(record) == key), None)
+    if exact is not None:
+        return exact
+    if role != "scan_region_native_common":
+        return None
+    return next(
+        (
+            record
+            for record in records
+            if record.role == role and _compatible_case_key(_case_key(record), key)
+        ),
+        None,
+    )
 
 
 def _matching_image_record(records, key):
-    return next((record for record in records if record.content_type == "image" and _case_key(record) == key), None)
+    return next(
+        (
+            record
+            for record in records
+            if record.role in {"transformed_image", "source_image_view"} and _case_key(record) == key
+        ),
+        None,
+    )
 
 
 def _fallback_case(root: Path) -> list[dict[str, DerivativeRecord]]:
@@ -572,7 +710,20 @@ def _find_fallback_path(root: Path, names: tuple[str, ...]) -> Path | None:
 
 
 def _case_key(record: DerivativeRecord) -> tuple[str, str, str | None, int | None, str]:
-    return record.subject_id, record.site, record.session_id, record.stack_index, record.space
+    return record.subject_id, _filter_site(record.site), record.session_id, record.stack_index, record.space
+
+
+def _compatible_case_key(
+    candidate: tuple[str, str, str | None, int | None, str],
+    requested: tuple[str, str, str | None, int | None, str],
+) -> bool:
+    if candidate[:3] != requested[:3] or candidate[4] != requested[4]:
+        return False
+    return _compatible_stack_index(candidate[3], requested[3])
+
+
+def _compatible_stack_index(left: int | None, right: int | None) -> bool:
+    return left == right
 
 
 def _load_volume(path: Path, *, scaling: str = "bmd") -> _LoadedVolume:
@@ -776,6 +927,16 @@ def _write_map(path: Path, array: np.ndarray, reference: _LoadedVolume) -> None:
     sitk.WriteImage(image, str(path))
 
 
+def _load_map(path: Path) -> np.ndarray:
+    if path.suffix == ".npy":
+        return np.load(path, allow_pickle=False)
+    if path.name.endswith((".nii", ".nii.gz")):
+        import SimpleITK as sitk
+
+        return sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+    raise ValueError(f"Unsupported map format: {path}")
+
+
 def _read_existing_records(root: Path) -> tuple[DerivativeRecord, ...]:
     path = manifest_path(root, "Microarchitecture")
     return read_manifest(path).records if path.exists() else ()
@@ -797,7 +958,7 @@ def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method,
 
 
 def _expected_output_signatures(case: dict[str, DerivativeRecord]) -> set[tuple[str, str, str | None]]:
-    names = {"Tb.Th", "Tb.Sp", "Tb.N", "Tb.BMD"}
+    names = {"Tb.Th", "Tb.Sp", "Tb.N", "Tt.BMD", "Tb.BMD"}
     if "cortical_mask" in case:
         names.update({"Ct.Th", "Ct.Po.Dm", "Ct.BMD"})
     return {("measurements_table", "table", None)} | {
@@ -805,12 +966,20 @@ def _expected_output_signatures(case: dict[str, DerivativeRecord]) -> set[tuple[
     }
 
 
+def _expected_native_map_signatures(case: dict[str, DerivativeRecord]) -> set[tuple[str, str, str | None]]:
+    return {signature for signature in _expected_output_signatures(case) if signature[0] != "measurements_table"}
+
+
 def _record_signature(record: DerivativeRecord) -> tuple[str, str, str | None]:
     return record.role, record.space, record.metadata.get("map_name")
 
 
+def _record_replacement_signature(record: DerivativeRecord) -> tuple[str, str, str | None, bool]:
+    return (*_record_signature(record), bool(record.metadata.get("use_common_region")))
+
+
 def _find_compatible_measurement_record(existing, case_key, input_ids, settings_hash, case):
-    required = _expected_output_signatures(case)
+    required = {("measurements_table", "table", None)}
     matching = [
         record for record in existing
         if _output_case_key(record) == case_key
@@ -821,7 +990,145 @@ def _find_compatible_measurement_record(existing, case_key, input_ids, settings_
     by_signature = {_record_signature(record): record for record in matching}
     if not required <= set(by_signature):
         return None
-    return by_signature[("measurements_table", "table", None)]
+    measurement_record = by_signature[("measurements_table", "table", None)]
+    if not _measurement_csv_has_required_parameters(measurement_record.path, case):
+        return None
+    return measurement_record
+
+
+def _find_compatible_native_map_records(existing, case_key, input_ids, settings_hash, case):
+    required = _expected_native_map_signatures(case)
+    matching = [
+        record for record in existing
+        if _output_case_key(record) == case_key
+        and record.inputs == input_ids
+        and record.settings_hash == settings_hash
+        and record.path.is_file()
+    ]
+    by_signature = {_record_signature(record): record for record in matching}
+    if not required <= set(by_signature):
+        return None
+    return {record.metadata["map_name"]: record for record in by_signature.values() if record.metadata.get("map_name")}
+
+
+def _load_native_maps_from_records(records: dict[str, DerivativeRecord]) -> dict[str, np.ndarray] | None:
+    try:
+        return {name: _load_map(record.path) for name, record in records.items()}
+    except Exception:
+        return None
+
+
+def _summarize_measurements(grayscale, masks, maps, spacing) -> dict[str, float]:
+    bone = np.asarray(masks["bone_segmentation"]) > 0
+    peri = np.asarray(masks["periosteal_mask"]) > 0
+    trab = np.asarray(masks["trabecular_mask"]) > 0
+    cort = np.asarray(masks["cortical_mask"]) > 0 if "cortical_mask" in masks else None
+    trab_region = trab & peri
+    if cort is not None:
+        trab_region = trab_region & ~cort
+        cort_region = cort & peri
+    else:
+        cort_region = None
+    trab_bone = bone & trab_region
+    tb_th = summary(np.asarray(maps["Tb.Th"])[trab_bone])
+    metrics = compartment_metrics(
+        bone_mask=bone,
+        periosteal_mask=peri,
+        trabecular_mask=trab,
+        cortical_mask=cort,
+        spacing=spacing,
+        mean_tb_th=tb_th["mean"],
+    )
+    tb_sp_values = np.asarray(maps["Tb.Sp"])[trab_region & ~trab_bone]
+    tb_sp = summary(tb_sp_values)
+    tb_n_map = np.asarray(maps["Tb.N"])
+    tb_n = summary(tb_n_map[trab_region])
+    tb_inverse_number_map = np.zeros(trab_region.shape, dtype=np.float32)
+    valid_tb_n = trab_region & np.isfinite(tb_n_map) & (tb_n_map > 0)
+    tb_inverse_number_map[valid_tb_n] = (1.0 / tb_n_map[valid_tb_n]).astype(np.float32, copy=False)
+    tb_inverse_number = summary(tb_inverse_number_map[valid_tb_n])
+    metrics.update(
+        {
+            "Tb.Th": tb_th["mean"],
+            "Tb.Th SD": tb_th["sd"],
+            "Tb.Th Min": tb_th["min"],
+            "Tb.Th Max": tb_th["max"],
+            "Tb.Sp": tb_sp["mean"],
+            "Tb.Sp SD": tb_sp["sd"],
+            "Tb.Sp Min": tb_sp["min"],
+            "Tb.Sp Max": tb_sp["max"],
+            "Tb.N": tb_n["mean"],
+            "Tb.N Median": tb_n["median"],
+            "Tb.N SD": tb_n["sd"],
+            "Tb.N P5": tb_n["p5"],
+            "Tb.N P25": tb_n["p25"],
+            "Tb.N P75": tb_n["p75"],
+            "Tb.N P95": tb_n["p95"],
+            "Tb.N Min": tb_n["min"],
+            "Tb.N Max": tb_n["max"],
+            "Tb.1/N.SD": tb_inverse_number["sd"],
+        }
+    )
+    image = np.asarray(grayscale, dtype=np.float32)
+    tt_mean, tt_sd = masked_mean_sd(image, peri)
+    tb_mean, tb_sd = masked_mean_sd(image, trab_region)
+    metrics.update({"Tt.BMD": tt_mean, "Tt.BMD SD": tt_sd, "Tb.BMD": tb_mean, "Tb.BMD SD": tb_sd})
+    if cort_region is not None:
+        cort_bone = bone & cort_region
+        ct_th = summary(np.asarray(maps["Ct.Th"])[cort_bone])
+        pore_summary = summary(np.asarray(maps["Ct.Po.Dm"])[cort_region & ~cort_bone])
+        ct_mean, ct_sd = masked_mean_sd(image, cort_region)
+        metrics.update(
+            {
+                "Ct.Th": ct_th["mean"],
+                "Ct.Th SD": ct_th["sd"],
+                "Ct.Th Min": ct_th["min"],
+                "Ct.Th Max": ct_th["max"],
+                "Ct.Po.Dm": pore_summary["mean"],
+                "Ct.Po.Dm SD": pore_summary["sd"],
+                "Ct.Po.Dm Min": pore_summary["min"],
+                "Ct.Po.Dm Max": pore_summary["max"],
+                "Ct.BMD": ct_mean,
+                "Ct.BMD SD": ct_sd,
+            }
+        )
+    return metrics
+
+
+def _masked_maps_for_measurements(maps, masks) -> dict[str, np.ndarray]:
+    peri = np.asarray(masks["periosteal_mask"]) > 0
+    trab = np.asarray(masks["trabecular_mask"]) > 0
+    cort = np.asarray(masks["cortical_mask"]) > 0 if "cortical_mask" in masks else None
+    trab_region = trab & peri & ~(cort if cort is not None else np.zeros_like(trab, dtype=bool))
+    result = {
+        "Tb.Th": np.where(trab_region, maps["Tb.Th"], 0),
+        "Tb.Sp": np.where(trab_region, maps["Tb.Sp"], 0),
+        "Tb.N": np.where(trab_region, maps["Tb.N"], 0),
+    }
+    if "Tt.BMD" in maps:
+        result["Tt.BMD"] = np.where(peri, maps["Tt.BMD"], 0)
+    if "Tb.BMD" in maps:
+        result["Tb.BMD"] = np.where(trab_region, maps["Tb.BMD"], 0)
+    if cort is not None:
+        cort_region = cort & peri
+        for name in ("Ct.Th", "Ct.Po.Dm", "Ct.BMD"):
+            if name in maps:
+                result[name] = np.where(cort_region, maps[name], 0)
+    return result
+
+
+def _measurement_csv_has_required_parameters(path: Path, case: dict[str, DerivativeRecord]) -> bool:
+    required = {"Tt.BMD", "Tb.BMD", "Tb.BV/TV", "Tb.Th", "Tb.Sp", "Tb.N"}
+    if "cortical_mask" in case:
+        required.update({"Ct.BMD", "Ct.Th", "Ct.Po", "Ct.Po.Dm"})
+    try:
+        import csv
+
+        with Path(path).open(newline="", encoding="utf-8") as handle:
+            present = {row.get("Parameter", "") for row in csv.DictReader(handle)}
+    except Exception:
+        return False
+    return required <= present
 
 
 def _emit(progress, subject_id, site, session_id, step, status, message, path=None) -> None:
