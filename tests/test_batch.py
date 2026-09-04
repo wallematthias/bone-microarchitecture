@@ -347,6 +347,46 @@ def test_batch_filter_accepts_compact_voi_token_for_normalized_site(tmp_path):
     assert cases[0]["transformed_image"].path == raw
 
 
+def test_batch_discovers_bone_contours_with_canonical_sidecar_roles(tmp_path):
+    sitk = pytest.importorskip("SimpleITK")
+    from bone_microarchitecture import batch
+
+    root = tmp_path / "dataset"
+    image = np.ones((3, 3, 3), dtype=np.float32)
+    mask = np.ones((3, 3, 3), dtype=np.uint8)
+    raw = root / "sub-001" / "ses-003" / "xct" / "sub-001_ses-003_voi-radiusleft_xct.nii.gz"
+    raw.parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(sitk.GetImageFromArray(image), str(raw))
+    roles = {
+        "seg": "bone_segmentation",
+        "full": "periosteal_mask",
+        "trab": "trabecular_mask",
+    }
+    for short_role, canonical_role in roles.items():
+        output = (
+            root
+            / "derivatives"
+            / "BoneContours"
+            / "sub-001"
+            / "ses-003"
+            / "xct"
+            / f"sub-001_ses-003_voi-radiusleft_desc-{short_role}_mask.nii.gz"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        sitk.WriteImage(sitk.GetImageFromArray(mask), str(output))
+        output.with_suffix("").with_suffix(".json").write_text(
+            json.dumps({"role": canonical_role, "short_role": short_role}),
+            encoding="utf-8",
+        )
+
+    cases = batch._filter_cases(batch._discover_cases(root), subject_id="001", site="radiusleft", session_id="003")
+
+    assert len(cases) == 1
+    assert cases[0]["bone_segmentation"].role == "bone_segmentation"
+    assert cases[0]["periosteal_mask"].role == "periosteal_mask"
+    assert cases[0]["trabecular_mask"].role == "trabecular_mask"
+
+
 def test_batch_groups_compact_and_underscored_sites_into_one_case(tmp_path):
     from bone_microarchitecture import batch
 

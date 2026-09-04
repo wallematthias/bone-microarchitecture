@@ -52,9 +52,13 @@ _MAP_ROLES = {
 _DISCOVERY_ROLE_MAP = {
     "image": "transformed_image",
     "segmentation": "bone_segmentation",
+    "bone_segmentation": "bone_segmentation",
     "full": "periosteal_mask",
+    "periosteal_mask": "periosteal_mask",
     "trab": "trabecular_mask",
+    "trabecular_mask": "trabecular_mask",
     "cort": "cortical_mask",
+    "cortical_mask": "cortical_mask",
     "scan_region_native_common": "scan_region_native_common",
     "common_region": "scan_region_native_common",
 }
