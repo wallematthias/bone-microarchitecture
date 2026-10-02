@@ -8,7 +8,13 @@ Lightweight microarchitecture measurements from binary masks and optional calibr
 
 Author: Matthias Walle.
 
-This package intentionally has no Slicer dependency and no image I/O dependency. Callers are responsible for loading images, calibration, and putting masks on a common grid.
+The array measurement API has no Slicer dependency and expects calibrated arrays
+on a common grid. File-based batch workflows use SimpleITK (and aimio-py for AIM)
+to load inputs and place cropped masks on the grayscale grid with nearest-neighbor
+resampling using origin, spacing, and direction. This is grid reconciliation, not
+registration; geometry-free arrays must already have the grayscale dimensions.
+The grid policy participates in batch cache compatibility so older incompatible
+maps are recomputed.
 
 Batch discovery accepts canonical segmentation, periosteal, trabecular, and cortical roles from shared contour derivatives and their sidecars. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 

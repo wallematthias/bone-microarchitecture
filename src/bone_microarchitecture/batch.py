@@ -139,7 +139,11 @@ def run_microarchitecture_batch(
             _emit(progress, subject_id, site, session_id, "measure", "reused", "Reused compatible measurements", reused.path)
             continue
 
-        masks = {role: _load_record_volume(record).array for role, record in case.items() if role != "transformed_image"}
+        masks = {
+            role: _mask_on_reference_grid(_load_record_volume(record), image)
+            for role, record in case.items()
+            if role != "transformed_image" and (role != "scan_region_native_common" or use_common_region)
+        }
         common = masks.pop("scan_region_native_common", None) if use_common_region else None
         common_mask = np.asarray(common) > 0 if common is not None else None
 
@@ -263,7 +267,7 @@ def run_microarchitecture_batch(
         ]
         merged_records.extend(output_records)
         manifest = DerivativeManifest.create(
-            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.2.4"},
+            "Microarchitecture", root, {"name": "bone-microarchitecture", "version": "0.2.5"},
             records=tuple(merged_records),
         )
         write_manifest(manifest, manifest_path(root, "Microarchitecture"))
@@ -754,6 +758,36 @@ def _load_record_volume(record: DerivativeRecord) -> _LoadedVolume:
     return _load_volume(record.path, scaling=scaling)
 
 
+def _mask_on_reference_grid(volume: _LoadedVolume, reference: _LoadedVolume) -> np.ndarray:
+    """Place a native/cropped mask on the grayscale grid using physical coordinates.
+
+    Geometry-free arrays must already have the reference shape. This is not a
+    registration: it only reconciles grid/crop differences in one physical space.
+    """
+    mask = np.asarray(volume.array) > 0
+    if volume.sitk_image is None or reference.sitk_image is None:
+        if mask.shape != reference.array.shape:
+            raise ValueError("Mask without physical geometry must have the same shape as the grayscale image")
+        return mask
+    import SimpleITK as sitk
+
+    source = volume.sitk_image
+    target = reference.sitk_image
+    same_geometry = source.GetSize() == target.GetSize() and all(
+        np.allclose(left, right, rtol=0, atol=1e-6)
+        for left, right in ((source.GetSpacing(), target.GetSpacing()),
+                            (source.GetOrigin(), target.GetOrigin()),
+                            (source.GetDirection(), target.GetDirection()))
+    )
+    if same_geometry:
+        return mask
+    binary = sitk.GetImageFromArray(mask.astype(np.uint8))
+    binary.CopyInformation(source)
+    aligned = sitk.Resample(binary, target, sitk.Transform(3, sitk.sitkIdentity),
+                            sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+    return sitk.GetArrayFromImage(aligned).astype(bool)
+
+
 def _load_aim_volume(path: Path, *, scaling: str = "bmd") -> _LoadedVolume:
     try:
         import py_aimio
@@ -952,6 +986,7 @@ def _output_case_key(record: DerivativeRecord) -> tuple[str, str, str | None, in
 
 def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method, thickness_backend) -> str:
     payload = {
+        "mask_grid_policy": "physical-nearest-neighbor-v1",
         "inputs": list(input_ids),
         "spacing": [float(value) for value in spacing],
         "use_common_region": bool(use_common_region),

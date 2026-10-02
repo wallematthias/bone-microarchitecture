@@ -825,6 +825,29 @@ def test_batch_uses_nifti_geometry_and_common_region_for_measurement(tmp_path):
     assert all(record.path.suffixes[-2:] == [".nii", ".gz"] for record in map_records)
 
 
+@pytest.mark.parametrize("crop_size, origin", [(3, (1, 1, 1)), (5, (1, 0, 0))])
+def test_batch_aligns_mask_physical_geometry_before_measurement(tmp_path, crop_size, origin):
+    sitk = pytest.importorskip("SimpleITK")
+    from bone_microarchitecture.batch import run_microarchitecture_batch
+
+    records = []
+    for role in ("transformed_image", "bone_segmentation", "periosteal_mask", "trabecular_mask"):
+        array = np.full((5, 5, 5), 100, dtype=np.float32) if role == "transformed_image" else np.ones((crop_size,) * 3, dtype=np.uint8)
+        image = sitk.GetImageFromArray(array)
+        if role != "transformed_image":
+            image.SetOrigin(origin)
+        path = tmp_path / f"{role}.nii.gz"
+        sitk.WriteImage(image, str(path))
+        records.append(_record(tmp_path, role, path.name))
+    write_manifest(DerivativeManifest.create("Segmentation", tmp_path, {"name": "test", "version": "1"}, records=records),
+                   tmp_path / "derivatives/Segmentation/manifest.json")
+    result = run_microarchitecture_batch(tmp_path, thickness_method="edt", thickness_backend="cpu")
+    with result[0].path.open(newline="", encoding="utf-8") as handle:
+        measurements = {row["Parameter"]: float(row["Mean"]) for row in csv.DictReader(handle)}
+    assert measurements["Tb.TV"] == (27 if crop_size == 3 else 100)
+    assert measurements["Tb.BMD"] == 100
+
+
 def test_batch_preserves_unrelated_microarchitecture_manifest_records(tmp_path):
     """A rerun for one case must not erase already-complete unrelated cases."""
     from bone_microarchitecture.batch import run_microarchitecture_batch
