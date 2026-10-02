@@ -10,6 +10,8 @@ Author: Matthias Walle.
 
 This package intentionally has no Slicer dependency and no image I/O dependency. Callers are responsible for loading images, calibration, and putting masks on a common grid.
 
+Batch discovery accepts canonical segmentation, periosteal, trabecular, and cortical roles from shared contour derivatives and their sidecars. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## GPU Backends
 
 Exact Hildebrand sphere fitting supports three diameter-accumulation backends:
