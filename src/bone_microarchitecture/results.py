@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
+
+from .method import METHOD_METADATA
 
 
 MEASUREMENT_ORDER = (
@@ -67,15 +70,15 @@ PARAMETER_DEFINITIONS = {
     "Tb.BV/TV": "Trabecular bone volume divided by trabecular total volume, reported as a fraction.",
     "Tb.Th": "Mean maximal-sphere local thickness of trabecular bone.",
     "Tb.Sp": "Mean maximal-sphere local thickness of non-bone space in the trabecular compartment.",
-    "Tb.N": "Mean inverse ridge-to-ridge spacing estimate in the trabecular compartment.",
+    "Tb.N": "Inverse of mean ridge-to-ridge spacing; distribution columns describe the local inverse-spacing map.",
     "Tb.1/N.SD": "Standard deviation of ridge-to-ridge spacing used to estimate trabecular number.",
     "Tb.BV": "Trabecular bone volume.",
     "Tb.TV": "Trabecular compartment volume.",
     "Ct.BMD": "Mean grayscale/BMD value inside the cortical compartment.",
-    "Ct.Th": "Mean maximal-sphere local thickness of cortical bone.",
+    "Ct.Th": "Mean maximal-sphere local thickness of the cortical compartment, including internal pores.",
     "Ct.Po": "Cortical pore volume divided by cortical total volume, reported as a fraction.",
-    "Ct.Po.V": "Cortical pore volume.",
-    "Ct.Po.Dm": "Mean maximal-sphere local diameter of cortical pore space.",
+    "Ct.Po.V": "Selected intracortical pore volume after connectivity and size cleanup.",
+    "Ct.Po.Dm": "Mean maximal-sphere local diameter of the selected intracortical pores.",
     "Ct.BV": "Cortical bone volume.",
     "Ct.TV": "Cortical compartment volume.",
 }
@@ -117,7 +120,9 @@ def measurement_rows(metrics: dict[str, float], maps: dict[str, np.ndarray] | No
 
     Scalar parameters place their value in the ``Mean`` column. Parameters with
     an available map are summarized across positive finite map voxels and include
-    median, standard deviation, percentiles, and range.
+    median, standard deviation, percentiles, and range. Tb.N's Mean is the
+    reciprocal of mean spacing, while its other columns describe local inverse
+    spacings, not the spacing distribution.
     """
     ordered = [name for name in MEASUREMENT_ORDER if name in metrics]
     ordered.extend(sorted(name for name in metrics if name not in set(ordered)))
@@ -128,13 +133,16 @@ def measurement_rows(metrics: dict[str, float], maps: dict[str, np.ndarray] | No
     ]
 
 
-def write_measurement_csv(path, metrics: dict[str, float], maps: dict[str, np.ndarray] | None = None) -> None:
-    """Write formatted measurement rows to a CSV file."""
+def write_measurement_csv(path, metrics: dict[str, float], maps: dict[str, np.ndarray] | None = None, *, metadata=None) -> None:
+    """Write measurement rows and a JSON sidecar recording the scientific method."""
     rows = measurement_rows(metrics, maps)
     with Path(path).open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(SUMMARY_COLUMNS))
         writer.writeheader()
         writer.writerows(rows)
+    Path(path).with_suffix(".json").write_text(
+        json.dumps({**(metadata or {}), **METHOD_METADATA}, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def _measurement_row(name: str, metrics: dict[str, float], maps: dict[str, np.ndarray]) -> dict[str, object]:
@@ -158,6 +166,11 @@ def _measurement_row(name: str, metrics: dict[str, float], maps: dict[str, np.nd
                     "Max": float(values.max()),
                 }
             )
+            if name == "Tb.N":
+                # IPL's reported number is NOT the arithmetic map mean. Derive
+                # it from the actual exported subset, including common regions.
+                positive = values[values > 0]
+                row["Mean"] = float(1.0 / np.mean(1.0 / positive)) if positive.size else 0.0
     return row
 
 

@@ -15,7 +15,7 @@ _NEIGHBOR_OFFSETS = tuple(
 )
 
 
-def local_thickness_map(mask, spacing: tuple[float, float, float]) -> np.ndarray:
+def local_thickness_map(mask, spacing: tuple[float, float, float], *, domain_mask=None) -> np.ndarray:
     """Return a bounded distance-transform thickness preview.
 
     This fast map assigns each foreground voxel twice its distance to the
@@ -32,9 +32,9 @@ def local_thickness_map(mask, spacing: tuple[float, float, float]) -> np.ndarray
     binary = np.asarray(mask) > 0
     if not binary.any():
         return np.zeros(binary.shape, dtype=np.float32)
-    distance = ndimage.distance_transform_edt(binary, sampling=spacing)
+    distance = _phase_distance(binary, spacing)
     distance *= 2.0
-    return distance.astype(np.float32, copy=False)
+    return _mask_output(distance.astype(np.float32, copy=False), binary if domain_mask is None else binary & domain_mask)
 
 
 def hildebrand_thickness_map(
@@ -44,6 +44,7 @@ def hildebrand_thickness_map(
     backend: str = "auto",
     center_dominance_mm: float | None = None,
     diameter_margin_voxels: float = 0.5,
+    domain_mask=None,
 ) -> np.ndarray:
     """Return a Hildebrand-style maximal-sphere local thickness map.
 
@@ -65,6 +66,8 @@ def hildebrand_thickness_map(
         diameter_margin_voxels: Small voxel-scaled subtraction from sphere radius
             before reporting diameter. This keeps assignment conservative at the
             discretized boundary.
+        domain_mask: Optional reporting domain. It restricts ridge centres and
+            output after full-phase distance calculation, not the phase itself.
 
     Returns:
         Float32 local-thickness map in millimetres, zero outside ``mask``.
@@ -73,18 +76,23 @@ def hildebrand_thickness_map(
     if not binary.any():
         return np.zeros(binary.shape, dtype=np.float32)
     spacing = tuple(float(value) for value in spacing)
-    distance = ndimage.distance_transform_edt(binary, sampling=spacing)
+    distance = _phase_distance(binary, spacing)
     dominance_margin = float(center_dominance_mm if center_dominance_mm is not None else min(spacing) * 0.9)
     medial_axis = _medial_axis(distance, dominance_margin)
+    output_mask = binary if domain_mask is None else binary & np.asarray(domain_mask, dtype=bool)
+    # Do not turn the reporting boundary into a physical wall in the EDT.
+    # Suppress centres outside the reporting VOI only AFTER full-phase ridge
+    # extraction. This is our explicit GOBJ-boundary approximation.
+    medial_axis &= output_mask
     backend = str(backend or "auto").strip().lower()
     if backend == "auto":
         backend = default_thickness_backend()
     if backend == "mps":
-        return _mask_output(_accumulate_local_diameters_mps(distance, medial_axis, spacing, diameter_margin_voxels), binary)
+        return _mask_output(_accumulate_local_diameters_mps(distance, medial_axis, spacing, diameter_margin_voxels), output_mask)
     if backend == "opencl":
-        return _mask_output(_accumulate_local_diameters_opencl(distance, medial_axis, spacing, diameter_margin_voxels), binary)
+        return _mask_output(_accumulate_local_diameters_opencl(distance, medial_axis, spacing, diameter_margin_voxels), output_mask)
     if backend == "cpu":
-        return _mask_output(_accumulate_local_diameters_cpu(distance, medial_axis, spacing, diameter_margin_voxels), binary)
+        return _mask_output(_accumulate_local_diameters_cpu(distance, medial_axis, spacing, diameter_margin_voxels), output_mask)
     raise ValueError("Thickness backend must be one of: auto, cpu, mps, or opencl.")
 
 
@@ -145,7 +153,7 @@ def trabecular_number_map(
     is the inverse of that spacing field.
 
     Args:
-        bone_mask: Trabecular bone phase mask.
+        bone_mask: Native bone phase, including bone outside the reporting domain.
         domain_mask: Trabecular compartment mask.
         spacing: Voxel spacing in millimetres, ordered like the array axes.
         thickness_method: Spacing-field thickness method. ``"hildebrand"`` uses
@@ -167,13 +175,12 @@ def trabecular_number_map(
     if not bone.any() or not domain.any():
         return np.zeros(domain.shape, dtype=np.float32)
     spacing = tuple(float(value) for value in spacing)
-    bone = bone & domain
-    bone_distance = ndimage.distance_transform_edt(bone, sampling=spacing)
+    bone_distance = _phase_distance(bone, spacing)
     material_ridge = _medial_axis(bone_distance, float(material_center_dominance_voxels) * min(spacing))
-    inter_axis = domain & ~material_ridge
+    inter_axis = ~material_ridge
     method = str(thickness_method or "hildebrand").strip().lower()
     if method == "edt":
-        spacing_map = local_thickness_map(inter_axis, spacing)
+        spacing_map = local_thickness_map(inter_axis, spacing, domain_mask=domain)
     elif method == "hildebrand":
         spacing_map = hildebrand_thickness_map(
             inter_axis,
@@ -181,6 +188,7 @@ def trabecular_number_map(
             backend=backend,
             center_dominance_mm=float(spacing_center_dominance_voxels) * min(spacing),
             diameter_margin_voxels=diameter_margin_voxels,
+            domain_mask=domain,
         )
     else:
         raise ValueError("Trabecular number thickness_method must be 'hildebrand' or 'edt'.")
@@ -245,9 +253,28 @@ def _mask_output(thickness: np.ndarray, binary: np.ndarray) -> np.ndarray:
     return thickness
 
 
-def _sphere_centers(distance: np.ndarray, medial_axis: np.ndarray):
+def _phase_distance(binary: np.ndarray, spacing) -> np.ndarray:
+    """EDT with a symmetric outside-image sentinel on all six image faces.
+
+    Without padding scipy's all-foreground special case gives an asymmetric
+    distance to an implicit point outside the image. Such faces are NOT valid
+    anatomical boundaries; sphere suppression removes incomplete estimates.
+    """
+    padded = np.pad(binary, 1, mode="constant", constant_values=False)
+    return ndimage.distance_transform_edt(padded, sampling=spacing)[1:-1, 1:-1, 1:-1]
+
+
+def _sphere_centers(distance: np.ndarray, medial_axis: np.ndarray, spacing):
     z, y, x = np.nonzero(medial_axis)
     radius = distance[medial_axis].astype(np.float32, copy=False)
+    # Voxel faces, not voxel centres, delimit the acquired image. Suppression
+    # must happen here so CPU, Metal, and OpenCL use the same eligible spheres.
+    complete = np.ones(radius.shape, dtype=bool)
+    for axis, coord in enumerate((z, y, x)):
+        lower = (coord + 0.5) * spacing[axis]
+        upper = (distance.shape[axis] - coord - 0.5) * spacing[axis]
+        complete &= radius < np.minimum(lower, upper)
+    z, y, x, radius = z[complete], y[complete], x[complete], radius[complete]
     if radius.size == 0:
         return z, y, x, radius
     order = np.argsort(radius)[::-1]
@@ -262,7 +289,7 @@ def _accumulate_local_diameters_cpu(
 ) -> np.ndarray:
     shape = distance.shape
     thickness = np.zeros(shape, dtype=np.float32)
-    seed_z, seed_y, seed_x, seed_radius = _sphere_centers(distance, medial_axis)
+    seed_z, seed_y, seed_x, seed_radius = _sphere_centers(distance, medial_axis, spacing)
     diameter_margin = float(diameter_margin_voxels) * min(spacing)
     inclusion_tolerance = _sphere_inclusion_tolerance(spacing)
     for zc, yc, xc, radius in zip(seed_z, seed_y, seed_x, seed_radius):
@@ -285,7 +312,7 @@ def _accumulate_local_diameters_mps(
 ) -> np.ndarray:
     from .metal import metal_hildebrand_thickness_map
 
-    seed_z, seed_y, seed_x, seed_radius = _sphere_centers(distance, medial_axis)
+    seed_z, seed_y, seed_x, seed_radius = _sphere_centers(distance, medial_axis, spacing)
     return metal_hildebrand_thickness_map(
         shape=distance.shape,
         seed_z=seed_z,
@@ -306,7 +333,7 @@ def _accumulate_local_diameters_opencl(
 ) -> np.ndarray:
     from .opencl import opencl_hildebrand_thickness_map
 
-    seed_z, seed_y, seed_x, seed_radius = _sphere_centers(distance, medial_axis)
+    seed_z, seed_y, seed_x, seed_radius = _sphere_centers(distance, medial_axis, spacing)
     return opencl_hildebrand_thickness_map(
         shape=distance.shape,
         seed_z=seed_z,

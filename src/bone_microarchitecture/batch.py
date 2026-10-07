@@ -25,8 +25,9 @@ from bone_imaging_derivatives import (
 from bone_imaging_derivatives.layout import manifest_path, record_output_path, voi_token
 
 from .pipeline import compute_microarchitecture
+from .method import METHOD_METADATA
 from .metrics import compartment_metrics, masked_mean_sd
-from .results import write_measurement_csv
+from .results import MicroarchitectureResult, write_measurement_csv
 from .thickness import summary
 
 
@@ -45,6 +46,7 @@ _MAP_ROLES = {
     "Tb.N": "trabecular_number_map",
     "Ct.Th": "cortical_thickness_map",
     "Ct.Po.Dm": "cortical_porosity_map",
+    "Ct.Po.Mask": "material_labelmap",
     "Tt.BMD": "material_map",
     "Tb.BMD": "material_map",
     "Ct.BMD": "material_map",
@@ -88,8 +90,9 @@ def run_microarchitecture_batch(
     """Measure every manifest-discovered case and write Microarchitecture outputs.
 
     The workflow intentionally only owns derivative discovery and output writing.
-    It clips biological masks to the optional common scan-region mask before
-    calling :func:`compute_microarchitecture`, which retains the one-case API.
+    It computes native biological maps first, then restricts their summaries to
+    the optional common scan-region mask without changing pore selection or
+    creating artificial thickness boundaries.
     Simple, unambiguous ``.npy`` filenames are accepted when manifests are not
     yet available, primarily for lightweight command-line workflows.
     """
@@ -201,13 +204,14 @@ def run_microarchitecture_batch(
             root, "Microarchitecture", subject_id, site, session_part, measurement_dir, filename
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_measurement_csv(output_path, measurements, measurement_maps)
         record_metadata = {
+            **METHOD_METADATA,
             "use_common_region": common_mask is not None,
             "thickness_method": thickness_method,
             "thickness_backend": resolved_backend,
             "settings_hash": settings_hash,
         }
+        write_measurement_csv(output_path, measurements, measurement_maps, metadata=record_metadata)
         measurement_record = DerivativeRecord(
                 derivative="Microarchitecture",
                 role="measurements_table",
@@ -247,6 +251,7 @@ def run_microarchitecture_batch(
                         source="generated",
                         inputs=native_input_ids,
                         metadata={
+                            **METHOD_METADATA,
                             "use_common_region": False,
                             "thickness_method": thickness_method,
                             "thickness_backend": resolved_backend,
@@ -986,6 +991,7 @@ def _output_case_key(record: DerivativeRecord) -> tuple[str, str, str | None, in
 
 def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method, thickness_backend) -> str:
     payload = {
+        **METHOD_METADATA,
         "mask_grid_policy": "physical-nearest-neighbor-v1",
         "inputs": list(input_ids),
         "spacing": [float(value) for value in spacing],
@@ -999,7 +1005,7 @@ def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method,
 def _expected_output_signatures(case: dict[str, DerivativeRecord]) -> set[tuple[str, str, str | None]]:
     names = {"Tb.Th", "Tb.Sp", "Tb.N", "Tt.BMD", "Tb.BMD"}
     if "cortical_mask" in case:
-        names.update({"Ct.Th", "Ct.Po.Dm", "Ct.BMD"})
+        names.update({"Ct.Th", "Ct.Po.Dm", "Ct.Po.Mask", "Ct.BMD"})
     return {("measurements_table", "table", None)} | {
         (_MAP_ROLES.get(name, "material_map"), "native", name) for name in names
     }
@@ -1057,6 +1063,35 @@ def _load_native_maps_from_records(records: dict[str, DerivativeRecord]) -> dict
         return None
 
 
+def restrict_measurements(result, masks, region, spacing, *, grayscale=None) -> MicroarchitectureResult:
+    """Summarize native maps in an aligned reporting region, without recomputing biology.
+
+    ``masks`` uses the batch semantic roles (bone_segmentation, periosteal_mask,
+    trabecular_mask, optional cortical_mask). The selected native pore mask must
+    remain intact until this step, even if the region leaves fewer than five
+    voxels of a pore. If grayscale is omitted, existing BMD is summarized from
+    the native Tt.BMD map; results without grayscale/BMD stay without BMD.
+    """
+    region = np.asarray(region, dtype=bool)
+    if region.ndim != 3 or any(np.shape(mask) != region.shape for mask in masks.values()):
+        raise ValueError("Analysis region and native masks must be aligned 3D arrays")
+    if grayscale is None and any(name in result.measurements for name in ("Tt.BMD", "Tb.BMD", "Ct.BMD")):
+        if "Tt.BMD" not in result.maps:
+            raise ValueError("Existing BMD requires grayscale or a native Tt.BMD map")
+        grayscale = result.maps["Tt.BMD"]
+    if grayscale is not None and np.shape(grayscale) != region.shape:
+        raise ValueError("Grayscale and analysis region must have the same shape")
+    restricted_masks = {role: np.asarray(mask, dtype=bool) & region for role, mask in masks.items()}
+    image = np.zeros(region.shape, dtype=np.float32) if grayscale is None else grayscale
+    metrics = _summarize_measurements(image, restricted_masks, result.maps, spacing)
+    metrics = {name: value for name, value in metrics.items() if name in result.measurements}
+    return MicroarchitectureResult(
+        measurements=metrics,
+        maps=_masked_maps_for_measurements(result.maps, restricted_masks),
+        metadata={**result.metadata, "reporting_region": "restricted-native-maps"},
+    )
+
+
 def _summarize_measurements(grayscale, masks, maps, spacing) -> dict[str, float]:
     bone = np.asarray(masks["bone_segmentation"]) > 0
     peri = np.asarray(masks["periosteal_mask"]) > 0
@@ -1077,6 +1112,7 @@ def _summarize_measurements(grayscale, masks, maps, spacing) -> dict[str, float]
         cortical_mask=cort,
         spacing=spacing,
         mean_tb_th=tb_th["mean"],
+        pore_mask=maps.get("Ct.Po.Mask"),
     )
     tb_sp_values = np.asarray(maps["Tb.Sp"])[trab_region & ~trab_bone]
     tb_sp = summary(tb_sp_values)
@@ -1096,7 +1132,7 @@ def _summarize_measurements(grayscale, masks, maps, spacing) -> dict[str, float]
             "Tb.Sp SD": tb_sp["sd"],
             "Tb.Sp Min": tb_sp["min"],
             "Tb.Sp Max": tb_sp["max"],
-            "Tb.N": tb_n["mean"],
+            "Tb.N": 1.0 / tb_inverse_number["mean"] if tb_inverse_number["mean"] > 0 else 0.0,
             "Tb.N Median": tb_n["median"],
             "Tb.N SD": tb_n["sd"],
             "Tb.N P5": tb_n["p5"],
@@ -1113,9 +1149,9 @@ def _summarize_measurements(grayscale, masks, maps, spacing) -> dict[str, float]
     tb_mean, tb_sd = masked_mean_sd(image, trab_region)
     metrics.update({"Tt.BMD": tt_mean, "Tt.BMD SD": tt_sd, "Tb.BMD": tb_mean, "Tb.BMD SD": tb_sd})
     if cort_region is not None:
-        cort_bone = bone & cort_region
-        ct_th = summary(np.asarray(maps["Ct.Th"])[cort_bone])
-        pore_summary = summary(np.asarray(maps["Ct.Po.Dm"])[cort_region & ~cort_bone])
+        ct_th = summary(np.asarray(maps["Ct.Th"])[cort_region])
+        pores = np.asarray(maps["Ct.Po.Mask"]) > 0
+        pore_summary = summary(np.asarray(maps["Ct.Po.Dm"])[cort_region & pores])
         ct_mean, ct_sd = masked_mean_sd(image, cort_region)
         metrics.update(
             {
@@ -1150,7 +1186,7 @@ def _masked_maps_for_measurements(maps, masks) -> dict[str, np.ndarray]:
         result["Tb.BMD"] = np.where(trab_region, maps["Tb.BMD"], 0)
     if cort is not None:
         cort_region = cort & peri
-        for name in ("Ct.Th", "Ct.Po.Dm", "Ct.BMD"):
+        for name in ("Ct.Th", "Ct.Po.Dm", "Ct.Po.Mask", "Ct.BMD"):
             if name in maps:
                 result[name] = np.where(cort_region, maps[name], 0)
     return result

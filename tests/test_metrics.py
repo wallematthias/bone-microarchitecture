@@ -52,8 +52,9 @@ def test_compartment_metrics_report_volumes_and_ratios_as_fractions():
     assert metrics["Tb.BV/TV"] == pytest.approx(0.25)
     assert metrics["Ct.BV"] == pytest.approx(0.125)
     assert metrics["Ct.TV"] == pytest.approx(0.5)
-    assert metrics["Ct.Po.V"] == pytest.approx(0.375)
-    assert metrics["Ct.Po"] == pytest.approx(0.75)
+    # Unenclosed background in this tiny fixture is not intracortical porosity.
+    assert metrics["Ct.Po.V"] == 0.0
+    assert metrics["Ct.Po"] == 0.0
     assert metrics["Tb.N"] == pytest.approx(1.0)
 
 

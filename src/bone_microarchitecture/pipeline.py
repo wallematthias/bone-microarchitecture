@@ -4,6 +4,8 @@ import numpy as np
 
 from .geometry import as_bool_mask, validate_same_shape, validate_spacing
 from .metrics import compartment_metrics, masked_mean_sd
+from .method import METHOD_METADATA
+from .pores import cortical_pore_mask
 from .results import MicroarchitectureResult
 from .thickness import (
     default_thickness_backend,
@@ -45,13 +47,13 @@ def compute_microarchitecture(
         ``Tb.Th``: mean local thickness of trabecular bone, in mm.
         ``Tb.Sp``: mean local thickness of non-bone space in the trabecular
         compartment, in mm.
-        ``Tb.N``: mean inverse ridge-to-ridge spacing estimate, in 1/mm.
+        ``Tb.N``: inverse mean ridge-to-ridge spacing estimate, in 1/mm.
         ``Tb.1/N.SD``: standard deviation of ridge-to-ridge spacing, in mm.
         ``Tb.BV`` and ``Tb.TV``: trabecular bone and compartment volumes, in mm^3.
 
     Calculated cortical outputs when ``cortical_mask`` is provided:
         ``Ct.BMD``: mean grayscale/BMD inside the cortical compartment.
-        ``Ct.Th``: mean local thickness of cortical bone, in mm.
+        ``Ct.Th``: mean local thickness of the cortical compartment, in mm.
         ``Ct.Po``: cortical pore volume divided by cortical total volume,
         reported as a unitless fraction.
         ``Ct.Po.V``: cortical pore volume, in mm^3.
@@ -87,7 +89,6 @@ def compute_microarchitecture(
     else:
         cort_region = None
     trab_bone = bone & trab_region
-    cort_bone = None if cort_region is None else bone & cort_region
     tb_th_map = _thickness_map(
         trab_bone,
         spacing,
@@ -95,15 +96,16 @@ def compute_microarchitecture(
         thickness_backend=resolved_thickness_backend,
     )
     tb_sp_map = _thickness_map(
-        trab_region & ~trab_bone,
+        ~bone,
         spacing,
+        domain_mask=trab_region,
         thickness_method=thickness_method,
         thickness_backend=resolved_thickness_backend,
     )
     tb_th = summary(tb_th_map[trab_bone])
     tb_sp = summary(tb_sp_map[trab_region & ~trab_bone])
     tb_n_map = trabecular_number_map(
-        trab_bone,
+        bone,
         trab_region,
         spacing,
         thickness_method=thickness_method,
@@ -114,6 +116,7 @@ def compute_microarchitecture(
     valid_tb_n = trab_region & np.isfinite(tb_n_map) & (tb_n_map > 0)
     tb_inverse_number_map[valid_tb_n] = (1.0 / tb_n_map[valid_tb_n]).astype(np.float32, copy=False)
     tb_inverse_number = summary(tb_inverse_number_map[valid_tb_n])
+    pores = None if cort_region is None else cortical_pore_mask(bone, cort_region)
 
     metrics = compartment_metrics(
         bone_mask=bone,
@@ -122,8 +125,9 @@ def compute_microarchitecture(
         cortical_mask=cort,
         spacing=spacing,
         mean_tb_th=tb_th["mean"],
+        pore_mask=pores,
     )
-    metrics["Tb.N"] = tb_n["mean"]
+    metrics["Tb.N"] = 1.0 / tb_inverse_number["mean"] if tb_inverse_number["mean"] > 0 else 0.0
     metrics.update(
         {
             "Tb.Th": tb_th["mean"],
@@ -148,14 +152,14 @@ def compute_microarchitecture(
 
     maps = {"Tb.Th": tb_th_map, "Tb.Sp": tb_sp_map, "Tb.N": tb_n_map}
 
-    if cort_bone is not None:
+    if cort_region is not None:
         ct_th_map = _thickness_map(
-            cort_bone,
+            cort_region,
             spacing,
             thickness_method=thickness_method,
             thickness_backend=resolved_thickness_backend,
         )
-        ct_th = summary(ct_th_map[cort_bone])
+        ct_th = summary(ct_th_map[cort_region])
         metrics.update(
             {
                 "Ct.Th": ct_th["mean"],
@@ -166,12 +170,12 @@ def compute_microarchitecture(
         )
         maps["Ct.Th"] = ct_th_map
         pore_map = _thickness_map(
-            cort_region & ~cort_bone,
+            pores,
             spacing,
             thickness_method=thickness_method,
             thickness_backend=resolved_thickness_backend,
         )
-        pore_summary = summary(pore_map[cort_region & ~cort_bone])
+        pore_summary = summary(pore_map[pores])
         metrics.update(
             {
                 "Ct.Po.Dm": pore_summary["mean"],
@@ -181,6 +185,9 @@ def compute_microarchitecture(
             }
         )
         maps["Ct.Po.Dm"] = pore_map
+        # Keep the biological selection separate from valid diameter voxels;
+        # boundary-suppressed pores must still count toward pore volume.
+        maps["Ct.Po.Mask"] = pores.astype(np.float32)
 
     if image is not None:
         tt_mean, tt_sd = masked_mean_sd(image, peri)
@@ -201,16 +208,17 @@ def compute_microarchitecture(
         measurements=metrics,
         maps=maps,
         metadata={
+            **METHOD_METADATA,
             "thickness_method": thickness_method,
             "thickness_backend": resolved_thickness_backend,
         },
     )
 
 
-def _thickness_map(mask, spacing, *, thickness_method: str, thickness_backend: str):
+def _thickness_map(mask, spacing, *, thickness_method: str, thickness_backend: str, domain_mask=None):
     """Dispatch one binary mask to the requested thickness-map implementation."""
     if thickness_method in {"edt", "distance", "distance_transform"}:
-        return local_thickness_map(mask, spacing)
+        return local_thickness_map(mask, spacing, domain_mask=domain_mask)
     if thickness_method in {"hildebrand", "sphere_fitting", "sphere-fitting", "exact"}:
-        return hildebrand_thickness_map(mask, spacing, backend=thickness_backend)
+        return hildebrand_thickness_map(mask, spacing, backend=thickness_backend, domain_mask=domain_mask)
     raise ValueError("Thickness method must be one of: edt or hildebrand.")

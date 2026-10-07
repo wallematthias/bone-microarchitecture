@@ -134,7 +134,8 @@ def test_compartment_masks_are_intersected_with_bone_segmentation_for_bone_measu
     assert result.measurements["Tb.BMD"] == pytest.approx(((17 * 100.0) + 300.0) / 18.0)
     assert result.measurements["Ct.BMD"] == pytest.approx(((8 * 200.0) + 900.0) / 9.0)
     assert np.count_nonzero(result.maps["Tb.Th"]) == 1
-    assert np.count_nonzero(result.maps["Ct.Th"]) == 1
+    # Thickness uses the compartment, while Ct.BV uses mineralized bone.
+    assert np.count_nonzero(result.maps["Ct.Th"]) == 9
     assert np.count_nonzero(result.maps["Tb.BMD"]) == 18
     assert np.count_nonzero(result.maps["Ct.BMD"]) == 9
     assert result.maps["Tb.Th"][2, 2, 1] > 0
@@ -142,13 +143,14 @@ def test_compartment_masks_are_intersected_with_bone_segmentation_for_bone_measu
 
 
 def test_cortical_porosity_reports_pore_diameter_distribution():
-    peri = np.ones((9, 9, 9), dtype=bool)
+    peri = np.zeros((11, 41, 41), dtype=bool)
+    peri[:, 3:38, 3:38] = True
     trab = np.zeros_like(peri)
-    trab[3:6, 3:6, 3:6] = True
+    trab[:, 12:29, 12:29] = True
     cort = peri & ~trab
     bone = cort.copy()
-    bone[1:4, 1:4, 1:4] = False
-    bone[5:8, 5:8, 5:8] = False
+    bone[2:9, 6:9, 6:9] = False
+    bone[2:9, 31:33, 31:33] = False
 
     result = compute_microarchitecture(
         bone_mask=bone,
@@ -190,15 +192,11 @@ def test_spacing_must_be_three_positive_values():
         )
 
 
-def test_thickness_map_uses_bounded_distance_transform_memory():
-    import inspect
-
-    from bone_microarchitecture import thickness
-
-    source = inspect.getsource(thickness.local_thickness_map)
-    assert "distance_transform_edt" in source
-    assert "binary_dilation" not in source
-    assert "_ellipsoid_structure" not in source
+def test_all_foreground_distance_preview_has_symmetric_image_boundaries():
+    result = local_thickness_map(np.ones((7, 7, 7), dtype=bool), (1., 1., 1.))
+    assert result.dtype == np.float32
+    for axis in range(3):
+        np.testing.assert_array_equal(result, np.flip(result, axis=axis))
 
 
 def test_exact_hildebrand_thickness_has_cpu_and_optional_mps_backends():
