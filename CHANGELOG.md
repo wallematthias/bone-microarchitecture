@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-07
+
 ### Changed
 
 - Replace cortical non-bone porosity with slice-seeded, longitudinally grown, five-voxel-cleaned intracortical pores; persist `Ct.Po.Mask` independently of pore diameter.
