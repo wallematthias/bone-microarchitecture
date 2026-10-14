@@ -28,6 +28,19 @@ Exact Hildebrand sphere fitting supports three diameter-accumulation backends:
 
 Use `thickness_backend="auto"` to select Metal on macOS when available, OpenCL on Windows/Linux when available, and CPU otherwise.
 
+Automatic OpenCL selection requires an actual GPU and a successfully compiled
+kernel; a CPU OpenCL runtime is not considered GPU acceleration. Batch logs
+identify the device and any CPU fallback reason before computation. CSV JSON
+sidecars and map manifests record `thickness_backend`, `thickness_device`,
+`thickness_gpu`, and `thickness_backend_reason`. Reused maps retain their original
+backend provenance; reusing maps does not run the GPU again.
+
+Only sphere-diameter accumulation is GPU-accelerated. Distance transforms,
+ridge selection, statistics and image I/O remain on CPU. Installing
+`bone-microarchitecture[gpu]` installs platform-specific Python bindings, not
+the GPU manufacturer's driver/OpenCL runtime. Explicit GPU requests raise an
+error when unavailable; `auto` keeps CPU-only systems usable.
+
 Optional installs:
 
 ```bash

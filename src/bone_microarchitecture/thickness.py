@@ -97,24 +97,52 @@ def hildebrand_thickness_map(
 
 
 def default_thickness_backend() -> str:
-    """Choose the fastest available diameter-accumulation backend for this machine."""
-    if sys.platform == "darwin":
-        try:
-            from .metal import is_metal_available
+    """Choose a usable GPU backend, otherwise CPU (never OpenCL on a CPU)."""
+    return thickness_backend_status()["thickness_backend"]
 
-            if is_metal_available():
-                return "mps"
-        except Exception:
-            pass
-    else:
-        try:
-            from .opencl import is_opencl_available
 
-            if is_opencl_available():
-                return "opencl"
-        except Exception:
-            pass
-    return "cpu"
+def thickness_backend_status(backend: str = "auto") -> dict:
+    """Resolve diameter acceleration and report the device or CPU fallback reason.
+
+    Automatic selection checks the OpenCL kernel can compile before accepting
+    that runtime. Explicit GPU requests fail instead of silently using CPU.
+    """
+    requested = str(backend or "auto").strip().lower()
+    if requested not in {"auto", "cpu", "mps", "opencl"}:
+        raise ValueError("Thickness backend must be one of: auto, cpu, mps, or opencl.")
+    selected = ("mps" if sys.platform == "darwin" else "opencl") if requested == "auto" else requested
+    reason = "CPU explicitly selected."
+    if selected != "cpu":
+        try:
+            if selected == "mps":
+                import Metal
+
+                device = Metal.MTLCreateSystemDefaultDevice()
+                if device is None:
+                    raise RuntimeError("No Apple Metal GPU is available.")
+                device_name = str(device.name())
+            else:
+                import pyopencl as cl
+                from .opencl import _get_opencl_program
+
+                _, queue, _ = _get_opencl_program(cl)
+                device_name = str(queue.device.name).strip()
+            return {
+                "thickness_backend": selected,
+                "thickness_device": device_name,
+                "thickness_gpu": True,
+                "thickness_backend_reason": "GPU diameter accumulation enabled; other stages remain CPU-based.",
+            }
+        except Exception as exc:
+            reason = f"GPU unavailable ({selected}): {exc}"
+            if requested != "auto":
+                raise RuntimeError(reason) from exc
+    return {
+        "thickness_backend": "cpu",
+        "thickness_device": "CPU",
+        "thickness_gpu": False,
+        "thickness_backend_reason": reason,
+    }
 
 
 def separation_map(periosteal_mask, trabecular_mask, spacing: tuple[float, float, float]) -> np.ndarray:

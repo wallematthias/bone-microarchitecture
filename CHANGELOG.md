@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Prefer actual OpenCL GPU devices and compile the kernel before automatic selection. Fall back to CPU with an explicit reason if bindings, GPU drivers or kernel compilation are unavailable; explicit GPU requests still fail clearly.
+- Log the diameter backend and device before batch calculations and retain device provenance in CSV sidecars and native-map manifests, including reused maps.
+
 ## 0.3.0 - 2026-10-07
 
 ### Changed

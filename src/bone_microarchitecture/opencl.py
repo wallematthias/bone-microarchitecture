@@ -160,6 +160,4 @@ def _select_device(cl, *, prefer_gpu: bool):
                 return device
     if fallback is not None and not prefer_gpu:
         return fallback
-    if fallback is not None:
-        return fallback
-    raise RuntimeError("No OpenCL devices are available.")
+    raise RuntimeError("No OpenCL GPU is available; check the GPU's OpenCL driver/runtime.")

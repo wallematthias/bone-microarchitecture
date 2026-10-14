@@ -28,7 +28,7 @@ from .pipeline import compute_microarchitecture
 from .method import METHOD_METADATA
 from .metrics import compartment_metrics, masked_mean_sd
 from .results import MicroarchitectureResult, write_measurement_csv
-from .thickness import summary
+from .thickness import summary, thickness_backend_status
 
 
 _REQUIRED_ROLES = ("bone_segmentation", "periosteal_mask", "trabecular_mask")
@@ -153,6 +153,13 @@ def run_microarchitecture_batch(
         native_maps = None if native_map_records is None else _load_native_maps_from_records(native_map_records)
         if native_maps is None:
             native_map_records = None
+            backend_status = thickness_backend_status("cpu" if thickness_method == "edt" else thickness_backend)
+            _emit(
+                progress, subject_id, site, session_id, "backend", "ready",
+                f"Diameter accumulation backend={backend_status['thickness_backend']}; "
+                f"device={backend_status['thickness_device']}; GPU={backend_status['thickness_gpu']}. "
+                f"{backend_status['thickness_backend_reason']}",
+            )
             _emit(progress, subject_id, site, session_id, "measure", "started", "Computing microarchitecture")
             result = compute_microarchitecture(
                 grayscale=image.array,
@@ -162,7 +169,7 @@ def run_microarchitecture_batch(
                 cortical_mask=masks.get("cortical_mask"),
                 spacing=case_spacing,
                 thickness_method=thickness_method,
-                thickness_backend=thickness_backend,
+                thickness_backend=backend_status["thickness_backend"],
             )
             native_measurements = result.measurements
             native_maps = result.maps
@@ -186,7 +193,11 @@ def run_microarchitecture_batch(
                 native_maps,
                 case_spacing,
             )
-            resolved_backend = thickness_backend
+            backend_status = {
+                key: value for key, value in next(iter(native_map_records.values())).metadata.items()
+                if key.startswith("thickness_") and key != "thickness_method"
+            }
+            resolved_backend = backend_status.get("thickness_backend", "unknown")
         measurement_masks = masks
         if common_mask is not None:
             measurement_masks = {role: (np.asarray(mask) > 0) & common_mask for role, mask in masks.items()}
@@ -209,6 +220,7 @@ def run_microarchitecture_batch(
             "use_common_region": common_mask is not None,
             "thickness_method": thickness_method,
             "thickness_backend": resolved_backend,
+            **backend_status,
             "settings_hash": settings_hash,
         }
         write_measurement_csv(output_path, measurements, measurement_maps, metadata=record_metadata)
@@ -255,6 +267,7 @@ def run_microarchitecture_batch(
                             "use_common_region": False,
                             "thickness_method": thickness_method,
                             "thickness_backend": resolved_backend,
+                            **backend_status,
                             "settings_hash": native_map_hash,
                             "map_name": map_name,
                         },

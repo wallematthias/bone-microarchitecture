@@ -8,7 +8,7 @@ from .method import METHOD_METADATA
 from .pores import cortical_pore_mask
 from .results import MicroarchitectureResult
 from .thickness import (
-    default_thickness_backend,
+    thickness_backend_status,
     hildebrand_thickness_map,
     local_thickness_map,
     summary,
@@ -81,7 +81,10 @@ def compute_microarchitecture(
 
     thickness_method = str(thickness_method or "hildebrand").strip().lower()
     thickness_backend = str(thickness_backend or "auto").strip().lower()
-    resolved_thickness_backend = default_thickness_backend() if thickness_backend == "auto" else thickness_backend
+    backend_status = thickness_backend_status(
+        "cpu" if thickness_method in {"edt", "distance", "distance_transform"} else thickness_backend
+    )
+    resolved_thickness_backend = backend_status["thickness_backend"]
     trab_region = trab & peri
     if cort is not None:
         trab_region = trab_region & ~cort
@@ -211,6 +214,7 @@ def compute_microarchitecture(
             **METHOD_METADATA,
             "thickness_method": thickness_method,
             "thickness_backend": resolved_thickness_backend,
+            **backend_status,
         },
     )
 

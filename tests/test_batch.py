@@ -63,6 +63,20 @@ def _write_case(root, *, subject_id="SAMPLE001", site="tibia", session_id="1"):
     )
 
 
+def test_batch_reports_actual_backend_and_records_device(tmp_path):
+    from bone_microarchitecture.batch import run_microarchitecture_batch
+
+    _write_case(tmp_path)
+    events = []
+    records = run_microarchitecture_batch(
+        tmp_path, spacing=(1, 1, 1), thickness_backend="cpu", progress=events.append,
+    )
+    assert any("backend=cpu" in event.message and "GPU=False" in event.message for event in events)
+    metadata = json.loads(records[0].path.with_suffix(".json").read_text())
+    assert metadata["thickness_gpu"] is False
+    assert metadata["thickness_device"] == "CPU"
+
+
 def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurement_manifest(tmp_path):
     """A missing common-region intersection would inflate the exported Tb.TV."""
     from bone_microarchitecture.batch import run_microarchitecture_batch
@@ -1286,6 +1300,13 @@ def test_registered_and_native_measurements_share_native_maps(tmp_path, monkeypa
     records = read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
     assert any("/xct/measurements/" in str(record.path) for record in records)
     assert sum(1 for record in records if record.role == "trabecular_thickness_map") == 1
+    native_measurements = next(
+        record for record in records
+        if record.role == "measurements_table" and "/xct/measurements/" in str(record.path)
+    )
+    assert native_measurements.metadata["thickness_backend"] == "cpu"
+    assert native_measurements.metadata["thickness_gpu"] is False
+    assert native_measurements.metadata["thickness_device"] == "CPU"
     assert any(
         event.step == "maps"
         and event.status == "reused"

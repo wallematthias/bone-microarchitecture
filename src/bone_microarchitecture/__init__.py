@@ -10,6 +10,7 @@ from .pipeline import compute_microarchitecture
 from .results import MicroarchitectureResult, PARAMETER_DEFINITIONS
 from .thickness import (
     default_thickness_backend,
+    thickness_backend_status,
     hildebrand_thickness_map,
     local_thickness_map,
     trabecular_number_map,
@@ -27,6 +28,7 @@ __all__ = [
     "compute_microarchitecture",
     "run_microarchitecture_batch",
     "default_thickness_backend",
+    "thickness_backend_status",
     "hildebrand_thickness_map",
     "local_thickness_map",
     "opencl_hildebrand_thickness_map",
