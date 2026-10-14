@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-10-14
+
 ### Fixed
 
 - Prefer actual OpenCL GPU devices and compile the kernel before automatic selection. Fall back to CPU with an explicit reason if bindings, GPU drivers or kernel compilation are unavailable; explicit GPU requests still fail clearly.
