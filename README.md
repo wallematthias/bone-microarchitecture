@@ -69,7 +69,7 @@ pip install "bone-microarchitecture[gpu]"
 
 ## IPL-aligned measurement definitions
 
-The standard method is `ipl-aligned-v1`, replacing the previous definitions.
+The standard method is `ipl-aligned-region-v3`, replacing the previous definitions.
 It follows the supplied `IPL_UPAT_CALGARY_EVAL_XT2_NOREG.COM` evaluation recipe:
 
 - Pore selection uses enclosed XY seeds, Z-only hysteresis growth, a second XY
@@ -81,18 +81,28 @@ It follows the supplied `IPL_UPAT_CALGARY_EVAL_XT2_NOREG.COM` evaluation recipe:
   supplied script's denominator. `Ct.Po` is therefore not necessarily `1 - Ct.BV/Ct.TV`.
 - `Tb.Sp` and ridge spacing retain the full bone-phase context before restricting
   reporting to the trabecular compartment. `Tb.N` is inverse mean spacing.
-- Hildebrand fitting excludes sphere centres whose radius reaches the image's
-  physical boundary. Complete spheres may still contribute to end slices; no
-  fixed slice strip is blanked. CPU, Metal and OpenCL use the same centre filter.
+- Hildebrand fitting follows the documented IPL `suppress_boundary=2` policy:
+  distances and ridges use the full input phase, then sphere centres are
+  restricted to the reporting region. Spheres may extend beyond that region or
+  reach an acquired image face; output is clipped to the image and reporting
+  phase. No fixed slice strip is blanked. CPU, Metal and OpenCL share this policy.
   The optional `edt` preview remains a distance-transform approximation.
 
-Native maps are computed before common-region or Functional Bone restrictions.
-The additional `Ct.Po.Mask` map preserves pore membership independently of
-diameter fitting. Cropping a reporting region does not repeat pore cleanup or
-introduce new anatomical walls. `restrict_measurements` in the batch module
-applies this same reporting rule to array/scene results.
+Pass `analysis_mask` to constrain sphere centres and reporting to a common or
+Functional Bone region. Distances and ridge extraction retain full native phase
+context: the ROI is not a new bone/marrow wall. Native cortical pore selection
+is preserved before intersection; `Ct.Po.Mask` records it independently of diameter.
 
-Results and CSV JSON sidecars record the scientific method separately from the
+Each analysis owns its final maps. Native batch maps remain in `xct/maps/`;
+common-region maps are in `xct/registered_measurements/maps/`. The file-level
+`bone_microarchitecture.case.run_microarchitecture_case` helper saves Functional
+Bone maps in `output_dir/maps/`. Unchanged inputs, geometry, region and settings
+reuse that analysis's complete final outputs. Changed input contents or missing/
+rewritten maps invalidate reuse. Distance fields are recomputed, not cached.
+`restrict_measurements` remains a post-hoc reporting helper; it cannot change
+sphere eligibility and is not used for common/functional-region calculations.
+
+Results and CSV JSON sidecars record `ipl-aligned-region-v3` separately from the
 package version. Batch hashes invalidate pre-alignment maps and measurements;
 legacy results must be recalculated, not mixed into a new comparison. Ratios
 remain fractions, not percentages. For `Tb.N`, the CSV Mean is inverse mean

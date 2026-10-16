@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Constrain sphere centres to the requested common/functional region before fitting, retaining native distance/ridge context and cortical pore selection.
+- Follow documented IPL `suppress_boundary=2` centre eligibility without the extra whole-sphere image-edge rejection, consistently on CPU, Metal and OpenCL. Keep ridge and radius-correction epsilon settings unchanged.
+- Store common-region and Functional Bone maps in their own analysis folders. Reuse only compatible final outputs, fingerprint input contents/geometry and detect missing or rewritten maps; do not cache distance fields.
+- Record scientific method `ipl-aligned-region-v3`, invalidating earlier post-hoc native-map summaries and maps made with whole-sphere image-edge rejection.
+
 ## 0.3.1 - 2026-10-14
 
 ### Fixed

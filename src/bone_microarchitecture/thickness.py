@@ -65,9 +65,13 @@ def hildebrand_thickness_map(
             ``0.9 * min(spacing)``.
         diameter_margin_voxels: Small voxel-scaled subtraction from sphere radius
             before reporting diameter. This keeps assignment conservative at the
-            discretized boundary.
+            discretized boundary; it is not a verified translation of IPL's
+            ``assign_epsilon`` parameter.
         domain_mask: Optional reporting domain. It restricts ridge centres and
             output after full-phase distance calculation, not the phase itself.
+            This follows IPL's documented ``suppress_boundary=2`` policy: sphere
+            centres must be inside the domain, but spheres may extend beyond it
+            or reach an acquired image face.
 
     Returns:
         Float32 local-thickness map in millimetres, zero outside ``mask``.
@@ -82,7 +86,7 @@ def hildebrand_thickness_map(
     output_mask = binary if domain_mask is None else binary & np.asarray(domain_mask, dtype=bool)
     # Do not turn the reporting boundary into a physical wall in the EDT.
     # Suppress centres outside the reporting VOI only AFTER full-phase ridge
-    # extraction. This is our explicit GOBJ-boundary approximation.
+    # extraction, following the documented IPL suppress_boundary=2 policy.
     medial_axis &= output_mask
     backend = str(backend or "auto").strip().lower()
     if backend == "auto":
@@ -285,8 +289,9 @@ def _phase_distance(binary: np.ndarray, spacing) -> np.ndarray:
     """EDT with a symmetric outside-image sentinel on all six image faces.
 
     Without padding scipy's all-foreground special case gives an asymmetric
-    distance to an implicit point outside the image. Such faces are NOT valid
-    anatomical boundaries; sphere suppression removes incomplete estimates.
+    distance to an implicit point outside the image. Padding defines the finite
+    image EDT consistently; it does not recover anatomy outside the acquisition.
+    Mode 2 retains the resulting boundary ridges rather than suppressing them.
     """
     padded = np.pad(binary, 1, mode="constant", constant_values=False)
     return ndimage.distance_transform_edt(padded, sampling=spacing)[1:-1, 1:-1, 1:-1]
@@ -295,14 +300,8 @@ def _phase_distance(binary: np.ndarray, spacing) -> np.ndarray:
 def _sphere_centers(distance: np.ndarray, medial_axis: np.ndarray, spacing):
     z, y, x = np.nonzero(medial_axis)
     radius = distance[medial_axis].astype(np.float32, copy=False)
-    # Voxel faces, not voxel centres, delimit the acquired image. Suppression
-    # must happen here so CPU, Metal, and OpenCL use the same eligible spheres.
-    complete = np.ones(radius.shape, dtype=bool)
-    for axis, coord in enumerate((z, y, x)):
-        lower = (coord + 0.5) * spacing[axis]
-        upper = (distance.shape[axis] - coord - 0.5) * spacing[axis]
-        complete &= radius < np.minimum(lower, upper)
-    z, y, x, radius = z[complete], y[complete], x[complete], radius[complete]
+    # Mode 2 restricts centres at ridge selection, not whole-sphere containment.
+    # All backends clip sphere drawing to the acquired grid and mask output.
     if radius.size == 0:
         return z, y, x, radius
     order = np.argsort(radius)[::-1]

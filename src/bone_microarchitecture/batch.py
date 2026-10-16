@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -25,6 +25,7 @@ from bone_imaging_derivatives import (
 from bone_imaging_derivatives.layout import manifest_path, record_output_path, voi_token
 
 from .pipeline import compute_microarchitecture
+from .cache import input_fingerprints, output_file_states
 from .method import METHOD_METADATA
 from .metrics import compartment_metrics, masked_mean_sd
 from .results import MicroarchitectureResult, write_measurement_csv
@@ -90,9 +91,9 @@ def run_microarchitecture_batch(
     """Measure every manifest-discovered case and write Microarchitecture outputs.
 
     The workflow intentionally only owns derivative discovery and output writing.
-    It computes native biological maps first, then restricts their summaries to
-    the optional common scan-region mask without changing pore selection or
-    creating artificial thickness boundaries.
+    Each analysis computes its own region-constrained sphere maps, retaining
+    full native phase context and pore selection. Registered maps are stored
+    beside registered measurements, never substituted for native maps.
     Simple, unambiguous ``.npy`` filenames are accepted when manifests are not
     yet available, primarily for lightweight command-line workflows.
     """
@@ -124,15 +125,12 @@ def run_microarchitecture_batch(
         if use_common_region and "scan_region_native_common" in case:
             input_roles.append("scan_region_native_common")
         input_ids = tuple(case[role].record_id for role in input_roles)
-        native_input_roles = ["transformed_image", "bone_segmentation", "periosteal_mask", "trabecular_mask"]
-        if "cortical_mask" in case:
-            native_input_roles.append("cortical_mask")
-        native_input_ids = tuple(case[role].record_id for role in native_input_roles)
-        settings_hash = _compatibility_hash(input_ids, case_spacing, use_common_region, thickness_method, thickness_backend)
-        native_map_hash = _compatibility_hash(native_input_ids, case_spacing, False, thickness_method, thickness_backend)
+        fingerprints = input_fingerprints(case[role].path for role in input_roles)
+        has_common = "scan_region_native_common" in input_roles
+        settings_hash = _compatibility_hash(input_ids, case_spacing, has_common, thickness_method, thickness_backend, fingerprints)
         case_key = _output_case_key(case["bone_segmentation"])
         native_map_records = None if force else _find_compatible_native_map_records(
-            existing_records, case_key, native_input_ids, native_map_hash, case
+            existing_records, case_key, input_ids, settings_hash, case
         )
         reused = None if force or native_map_records is None else _find_compatible_measurement_record(
             existing_records, case_key, input_ids, settings_hash, case
@@ -168,10 +166,10 @@ def run_microarchitecture_batch(
                 trabecular_mask=masks["trabecular_mask"],
                 cortical_mask=masks.get("cortical_mask"),
                 spacing=case_spacing,
+                analysis_mask=common_mask,
                 thickness_method=thickness_method,
                 thickness_backend=backend_status["thickness_backend"],
             )
-            native_measurements = result.measurements
             native_maps = result.maps
             resolved_backend = result.metadata["thickness_backend"]
         else:
@@ -183,16 +181,10 @@ def run_microarchitecture_batch(
                 session_id,
                 "maps",
                 "reused",
-                "Reused native microarchitecture maps",
+                "Reused compatible analysis-region maps",
                 map_dir,
             )
             _emit(progress, subject_id, site, session_id, "measure", "started", "Summarizing existing microarchitecture maps")
-            native_measurements = _summarize_measurements(
-                image.array,
-                masks,
-                native_maps,
-                case_spacing,
-            )
             backend_status = {
                 key: value for key, value in next(iter(native_map_records.values())).metadata.items()
                 if key.startswith("thickness_") and key != "thickness_method"
@@ -201,12 +193,7 @@ def run_microarchitecture_batch(
         measurement_masks = masks
         if common_mask is not None:
             measurement_masks = {role: (np.asarray(mask) > 0) & common_mask for role, mask in masks.items()}
-        measurements = native_measurements if common_mask is None else _summarize_measurements(
-            image.array,
-            measurement_masks,
-            native_maps,
-            case_spacing,
-        )
+        measurements = _summarize_measurements(image.array, measurement_masks, native_maps, case_spacing)
         measurement_maps = _masked_maps_for_measurements(native_maps, measurement_masks)
         session_part = f"ses-{session_id}" if session_id else "ses-unknown"
         measurement_dir = "registered_measurements" if common_mask is not None else "measurements"
@@ -222,8 +209,10 @@ def run_microarchitecture_batch(
             "thickness_backend": resolved_backend,
             **backend_status,
             "settings_hash": settings_hash,
+            "analysis_region": "common" if has_common else "native",
+            "input_fingerprints": fingerprints,
+            "input_paths": {role: str(case[role].path.resolve()) for role in input_roles},
         }
-        write_measurement_csv(output_path, measurements, measurement_maps, metadata=record_metadata)
         measurement_record = DerivativeRecord(
                 derivative="Microarchitecture",
                 role="measurements_table",
@@ -247,7 +236,8 @@ def run_microarchitecture_batch(
                 extension = ".nii.gz" if image.sitk_image is not None else ".npy"
                 map_filename = f"sub-{subject_id}_{session_part}_voi-{voi_token(site)}_map-{map_name.lower().replace('.', '-')}{extension}"
                 map_path = record_output_path(
-                    root, "Microarchitecture", subject_id, site, session_part, "maps", map_filename
+                    root, "Microarchitecture", subject_id, site, session_part,
+                    "registered_measurements/maps" if has_common else "maps", map_filename
                 )
                 _write_map(map_path, map_array, image)
                 output_records.append(
@@ -261,20 +251,30 @@ def run_microarchitecture_batch(
                         space="native",
                         path=map_path,
                         source="generated",
-                        inputs=native_input_ids,
+                        inputs=input_ids,
                         metadata={
                             **METHOD_METADATA,
-                            "use_common_region": False,
+                            "use_common_region": has_common,
                             "thickness_method": thickness_method,
                             "thickness_backend": resolved_backend,
                             **backend_status,
-                            "settings_hash": native_map_hash,
+                            "settings_hash": settings_hash,
                             "map_name": map_name,
+                            "file_state": output_file_states([map_path])[str(map_path.resolve())],
                         },
                         content_type="image",
-                        settings_hash=native_map_hash,
+                        settings_hash=settings_hash,
                     )
                 )
+        cached_maps = list(native_map_records.values()) if native_map_records is not None else [
+            record for record in output_records
+            if record.settings_hash == settings_hash and record.content_type == "image"
+        ]
+        record_metadata["output_file_states"] = output_file_states(record.path for record in cached_maps)
+        write_measurement_csv(output_path, measurements, measurement_maps, metadata=record_metadata)
+        updated_record = replace(measurement_record, metadata=record_metadata)
+        output_records[output_records.index(measurement_record)] = updated_record
+        measurement_records[-1] = updated_record
         _emit(progress, subject_id, site, session_id, "measure", "completed", "Wrote measurements", output_path)
 
     if output_records:
@@ -1002,7 +1002,7 @@ def _output_case_key(record: DerivativeRecord) -> tuple[str, str, str | None, in
     return record.subject_id, record.site, record.session_id, record.stack_index
 
 
-def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method, thickness_backend) -> str:
+def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method, thickness_backend, fingerprints=None) -> str:
     payload = {
         **METHOD_METADATA,
         "mask_grid_policy": "physical-nearest-neighbor-v1",
@@ -1011,6 +1011,7 @@ def _compatibility_hash(input_ids, spacing, use_common_region, thickness_method,
         "use_common_region": bool(use_common_region),
         "thickness_method": str(thickness_method),
         "thickness_backend": str(thickness_backend),
+        "input_fingerprints": fingerprints,
     }
     return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
@@ -1062,6 +1063,8 @@ def _find_compatible_native_map_records(existing, case_key, input_ids, settings_
         and record.inputs == input_ids
         and record.settings_hash == settings_hash
         and record.path.is_file()
+        and (record.metadata.get("file_state") is None or
+             record.metadata["file_state"] == output_file_states([record.path])[str(record.path.resolve())])
     ]
     by_signature = {_record_signature(record): record for record in matching}
     if not required <= set(by_signature):
@@ -1077,7 +1080,11 @@ def _load_native_maps_from_records(records: dict[str, DerivativeRecord]) -> dict
 
 
 def restrict_measurements(result, masks, region, spacing, *, grayscale=None) -> MicroarchitectureResult:
-    """Summarize native maps in an aligned reporting region, without recomputing biology.
+    """Summarize existing maps in a subregion without changing sphere eligibility.
+
+    This post-hoc reporting helper is NOT a common/functional-region analysis.
+    Use ``compute_microarchitecture(analysis_mask=...)`` for region-specific
+    sphere fitting, as used by the scene and batch workflows.
 
     ``masks`` uses the batch semantic roles (bone_segmentation, periosteal_mask,
     trabecular_mask, optional cortical_mask). The selected native pore mask must

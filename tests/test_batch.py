@@ -150,7 +150,7 @@ def test_batch_discovers_manifest_inputs_clips_common_region_and_writes_measurem
         "trabecular_spacing_map",
         "trabecular_number_map",
     }
-    assert all(record.path.is_file() and "/xct/maps/" in str(record.path) for record in map_records)
+    assert all(record.path.is_file() and "/xct/registered_measurements/maps/" in str(record.path) for record in map_records)
     assert not any("/xct/registered/maps/" in str(record.path) for record in manifest.records)
 
 
@@ -165,6 +165,8 @@ def test_batch_loads_virtual_aim_source_image_view(monkeypatch, tmp_path):
         np.save(path, mask)
 
     source = tmp_path / "raw" / "scan.AIM"
+    source.parent.mkdir()
+    source.write_bytes(b"virtual AIM source; reader is stubbed below")
     calls = []
 
     def fake_load_virtual(record):
@@ -1231,8 +1233,8 @@ def test_batch_reuses_compatible_records_and_recomputes_when_settings_or_inputs_
     assert preserved in records
 
 
-def test_registered_and_native_measurements_share_native_maps(tmp_path, monkeypatch):
-    """Common-region measurements should reuse native maps instead of recomputing them."""
+def test_registered_and_native_measurements_keep_separate_region_maps(tmp_path, monkeypatch):
+    """A native run must never silently reuse registered-region sphere maps."""
     import bone_microarchitecture.batch as batch
 
     image = np.full((4, 4, 4), 100.0, dtype=np.float32)
@@ -1281,13 +1283,16 @@ def test_registered_and_native_measurements_share_native_maps(tmp_path, monkeypa
     )
     registered_records = read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
     assert any("/xct/registered_measurements/" in str(record.path) for record in registered_records)
-    assert any("/xct/maps/" in str(record.path) for record in registered_records)
-    assert not any("/xct/registered/maps/" in str(record.path) for record in registered_records)
+    assert any("/xct/registered_measurements/maps/" in str(record.path) for record in registered_records)
+    assert not any("/xct/maps/" in str(record.path) for record in registered_records)
 
-    def should_not_compute(**_kwargs):
-        raise AssertionError("native maps should be reused")
+    original = batch.compute_microarchitecture
+    computed = []
+    def counted_compute(**kwargs):
+        computed.append(kwargs.get("analysis_mask"))
+        return original(**kwargs)
 
-    monkeypatch.setattr(batch, "compute_microarchitecture", should_not_compute)
+    monkeypatch.setattr(batch, "compute_microarchitecture", counted_compute)
     progress_events = []
     batch.run_microarchitecture_batch(
         tmp_path,
@@ -1299,7 +1304,8 @@ def test_registered_and_native_measurements_share_native_maps(tmp_path, monkeypa
     )
     records = read_manifest(tmp_path / "derivatives/Microarchitecture/manifest.json").records
     assert any("/xct/measurements/" in str(record.path) for record in records)
-    assert sum(1 for record in records if record.role == "trabecular_thickness_map") == 1
+    assert sum(1 for record in records if record.role == "trabecular_thickness_map") == 2
+    assert computed == [None]
     native_measurements = next(
         record for record in records
         if record.role == "measurements_table" and "/xct/measurements/" in str(record.path)
@@ -1307,13 +1313,22 @@ def test_registered_and_native_measurements_share_native_maps(tmp_path, monkeypa
     assert native_measurements.metadata["thickness_backend"] == "cpu"
     assert native_measurements.metadata["thickness_gpu"] is False
     assert native_measurements.metadata["thickness_device"] == "CPU"
-    assert any(
-        event.step == "maps"
-        and event.status == "reused"
-        and event.message == "Reused native microarchitecture maps"
-        and str(event.path).endswith("/xct/maps")
-        for event in progress_events
-    )
+    computed.clear()
+    batch.run_microarchitecture_batch(tmp_path, spacing=(1, 1, 1), thickness_method="edt",
+                                     thickness_backend="cpu", require_common_region=True)
+    assert computed == []  # unchanged registered maps/results are still cached
+    changed = common_region.copy()
+    changed[1] = 0
+    np.save(tmp_path / paths["common"], changed)
+    batch.run_microarchitecture_batch(tmp_path, spacing=(1, 1, 1), thickness_method="edt",
+                                     thickness_backend="cpu", require_common_region=True)
+    assert len(computed) == 1
+    np.testing.assert_array_equal(computed[0], changed.astype(bool))
+    # Native maps survive a common-region edit and remain reusable.
+    computed.clear()
+    batch.run_microarchitecture_batch(tmp_path, spacing=(1, 1, 1), thickness_method="edt",
+                                     thickness_backend="cpu", use_common_region=False)
+    assert computed == []
 
 
 def test_grayscale_batch_persists_bmd_maps_with_deterministic_generic_role(tmp_path):

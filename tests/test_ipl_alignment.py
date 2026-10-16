@@ -39,13 +39,30 @@ def test_cortical_thickness_is_independent_of_mineralized_pores():
     assert porous.measurements["Ct.Th"] == pytest.approx(solid.measurements["Ct.Th"])
 
 
-def test_incomplete_sphere_centers_at_image_end_are_suppressed():
+def test_mode_two_keeps_sphere_centers_at_image_end():
     from bone_microarchitecture.thickness import _accumulate_local_diameters_cpu
     distance = np.zeros((9, 9, 9), dtype=float)
     distance[0, 4, 4] = 2.0  # This sphere extends beyond the available scan.
     centers = distance > 0
     result = _accumulate_local_diameters_cpu(distance, centers, (1., 1., 1.), 0.5)
-    assert not result.any()
+    # Mode 2 restricts centres to the ROI, not spheres to the acquired extent.
+    assert result[0, 4, 4] == pytest.approx(3.0)
+    assert result[2, 4, 4] == pytest.approx(3.0)
+    assert not result[3:].any()
+
+
+@pytest.mark.parametrize("z,width,expected", [(0, 1, 1.0), (1, 3, 3.0), (3, 7, 7.0)])
+def test_mode_two_keeps_image_edge_spheres_with_roi_centers(z, width, expected):
+    phase = np.zeros((7, 7, 7), dtype=bool)
+    start = (7 - width) // 2
+    phase[:, start:start + width, start:start + width] = True
+    region = np.zeros_like(phase)
+    region[z, 3, 3] = True
+    result = hildebrand_thickness_map(phase, (1., 1., 1.), backend="cpu", domain_mask=region)
+    # Full-phase EDT radii are 1, 2 and 4 at non-dominated centres. The ROI
+    # must not clip the EDT phase, and only the selected centre may contribute.
+    assert result[z, 3, 3] == pytest.approx(expected)
+    assert np.count_nonzero(result) == 1
 
 
 def test_complete_spheres_are_not_removed_just_because_output_reaches_end_slice():
@@ -139,10 +156,24 @@ def test_sphere_eligibility_is_symmetric_and_uses_physical_spacing():
     result = _accumulate_local_diameters_cpu(distance, distance > 0, (0.2, 1., 1.), 0.5)
     np.testing.assert_array_equal(result, np.flip(result, 0))
     assert result[1, 4, 4] == pytest.approx(0.3)
-    # End-slice centres are incomplete even though radius < one XY voxel.
+    # Anisotropic image-edge spheres remain eligible in mode 2 as well.
     only_ends = distance.copy()
     only_ends[1:-1] = 0
-    assert not _accumulate_local_diameters_cpu(only_ends, only_ends > 0, (0.2, 1., 1.), 0.5).any()
+    ends_result = _accumulate_local_diameters_cpu(only_ends, only_ends > 0, (0.2, 1., 1.), 0.5)
+    assert ends_result[0, 4, 4] == pytest.approx(0.3)
+    assert ends_result[-1, 4, 4] == pytest.approx(0.3)
+    np.testing.assert_array_equal(ends_result, np.flip(ends_result, 0))
+
+
+def test_mode_two_invalidates_complete_image_sphere_cache(monkeypatch):
+    from bone_microarchitecture import batch
+    args = ((), (0.0607, 0.0607, 0.0607), False, "hildebrand", "cpu")
+    current_hash = batch._compatibility_hash(*args)
+    previous_method = {**batch.METHOD_METADATA,
+        "measurement_method": "ipl-aligned-region-v2",
+        "boundary_policy": "full-phase-context-region-centres-complete-image-spheres"}
+    monkeypatch.setattr(batch, "METHOD_METADATA", previous_method)
+    assert batch._compatibility_hash(*args) != current_hash
 
 
 def test_scientific_method_invalidates_pre_alignment_cache_hash(monkeypatch):

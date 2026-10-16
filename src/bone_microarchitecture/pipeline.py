@@ -24,6 +24,7 @@ def compute_microarchitecture(
     bone_mask=None,
     cortical_mask=None,
     grayscale=None,
+    analysis_mask=None,
     thickness_method: str = "hildebrand",
     thickness_backend: str = "auto",
 ) -> MicroarchitectureResult:
@@ -32,6 +33,10 @@ def compute_microarchitecture(
     This function is intentionally image-I/O agnostic. Callers must load images,
     calibrate grayscale data when BMD is desired, and resample all masks/images
     to a shared voxel grid before calling it.
+
+    ``analysis_mask`` optionally constrains sphere centres and reporting to a
+    common or functional region. Distance fields and cortical pore selection
+    retain the full native phase context; the ROI is not an artificial wall.
 
     Masks are interpreted as:
         ``periosteal_mask``: full analysis compartment.
@@ -69,6 +74,7 @@ def compute_microarchitecture(
     bone = as_bool_mask(bone_mask, "bone_mask") if bone_mask is not None else trab
     cort = as_bool_mask(cortical_mask, "cortical_mask") if cortical_mask is not None else None
     image = None if grayscale is None else np.asarray(grayscale, dtype=np.float32)
+    analysis = None if analysis_mask is None else as_bool_mask(analysis_mask, "analysis_mask")
     validate_same_shape(
         {
             "periosteal_mask": peri,
@@ -76,6 +82,7 @@ def compute_microarchitecture(
             "bone_mask": bone,
             "cortical_mask": cort,
             "grayscale": image,
+            "analysis_mask": analysis,
         }
     )
 
@@ -91,10 +98,19 @@ def compute_microarchitecture(
         cort_region = cort & peri
     else:
         cort_region = None
+    native_trab_bone = bone & trab_region
+    native_cort_region = cort_region
+    pores = None if cort_region is None else cortical_pore_mask(bone, cort_region)
+    if analysis is not None:
+        peri = peri & analysis
+        trab_region = trab_region & analysis
+        if cort_region is not None:
+            cort_region = cort_region & analysis
     trab_bone = bone & trab_region
     tb_th_map = _thickness_map(
-        trab_bone,
+        native_trab_bone,
         spacing,
+        domain_mask=trab_region,
         thickness_method=thickness_method,
         thickness_backend=resolved_thickness_backend,
     )
@@ -119,13 +135,12 @@ def compute_microarchitecture(
     valid_tb_n = trab_region & np.isfinite(tb_n_map) & (tb_n_map > 0)
     tb_inverse_number_map[valid_tb_n] = (1.0 / tb_n_map[valid_tb_n]).astype(np.float32, copy=False)
     tb_inverse_number = summary(tb_inverse_number_map[valid_tb_n])
-    pores = None if cort_region is None else cortical_pore_mask(bone, cort_region)
 
     metrics = compartment_metrics(
         bone_mask=bone,
         periosteal_mask=peri,
-        trabecular_mask=trab,
-        cortical_mask=cort,
+        trabecular_mask=trab_region,
+        cortical_mask=cort_region,
         spacing=spacing,
         mean_tb_th=tb_th["mean"],
         pore_mask=pores,
@@ -157,8 +172,9 @@ def compute_microarchitecture(
 
     if cort_region is not None:
         ct_th_map = _thickness_map(
-            cort_region,
+            native_cort_region,
             spacing,
+            domain_mask=cort_region,
             thickness_method=thickness_method,
             thickness_backend=resolved_thickness_backend,
         )
@@ -175,10 +191,11 @@ def compute_microarchitecture(
         pore_map = _thickness_map(
             pores,
             spacing,
+            domain_mask=cort_region,
             thickness_method=thickness_method,
             thickness_backend=resolved_thickness_backend,
         )
-        pore_summary = summary(pore_map[pores])
+        pore_summary = summary(pore_map[pores & cort_region])
         metrics.update(
             {
                 "Ct.Po.Dm": pore_summary["mean"],
@@ -189,8 +206,8 @@ def compute_microarchitecture(
         )
         maps["Ct.Po.Dm"] = pore_map
         # Keep the biological selection separate from valid diameter voxels;
-        # boundary-suppressed pores must still count toward pore volume.
-        maps["Ct.Po.Mask"] = pores.astype(np.float32)
+        # Pores without a valid diameter must still count toward pore volume.
+        maps["Ct.Po.Mask"] = (pores & cort_region).astype(np.float32)
 
     if image is not None:
         tt_mean, tt_sd = masked_mean_sd(image, peri)
@@ -214,6 +231,7 @@ def compute_microarchitecture(
             **METHOD_METADATA,
             "thickness_method": thickness_method,
             "thickness_backend": resolved_thickness_backend,
+            "analysis_region": "restricted" if analysis is not None else "native",
             **backend_status,
         },
     )
